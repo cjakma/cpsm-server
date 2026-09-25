@@ -1,6 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { screenTimeForPlatform } = require("./screenTime");
 
 let DatabaseSync;
 try {
@@ -572,7 +573,9 @@ class Store {
       "ALTER TABLE pairing_sessions ADD COLUMN issuer_type TEXT NOT NULL DEFAULT 'child'",
       "ALTER TABLE pairing_sessions ADD COLUMN issuer_id TEXT NOT NULL DEFAULT ''",
       "ALTER TABLE pairing_sessions ADD COLUMN mapping_id TEXT",
-      "ALTER TABLE pairing_sessions ADD COLUMN confirmed_at TEXT"
+      "ALTER TABLE pairing_sessions ADD COLUMN confirmed_at TEXT",
+      "ALTER TABLE approval_requests ADD COLUMN kind TEXT NOT NULL DEFAULT 'app_launch'",
+      "ALTER TABLE approval_requests ADD COLUMN requested_minutes INTEGER"
     ]) {
       try {
         this.db.exec(statement);
@@ -670,7 +673,9 @@ class Store {
       status: request.status,
       decision: request.decision,
       createdAt: request.created_at,
-      decidedAt: request.decided_at
+      decidedAt: request.decided_at,
+      kind: request.kind || "app_launch",
+      requestedMinutes: request.requested_minutes == null ? null : Number(request.requested_minutes)
     }));
     const policy = this.db.prepare("SELECT * FROM policies LIMIT 1").get();
     if (policy) {
@@ -936,9 +941,9 @@ class Store {
       for (const command of this.state.commands) {
         commandInsert.run(command.id, command.deviceId, command.type, JSON.stringify(command.payload || {}), command.state || command.status || "queued", command.ack ? JSON.stringify(command.ack) : null, command.result ? JSON.stringify(command.result) : null, Number(command.retryCount || 0), Number(command.maxRetries || this.maxCommandRetries), command.idempotencyKey || null, command.leaseExpiresAt || null, command.expiresAt || new Date(Date.now() + 600000).toISOString(), command.createdAt || nowIso(), command.deliveredAt || null, command.completedAt || null);
       }
-      const approvalInsert = this.db.prepare("INSERT INTO approval_requests (id, device_id, child_name, device_name, app_name, executable_path, pid, event_id, status, decision, created_at, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+      const approvalInsert = this.db.prepare("INSERT INTO approval_requests (id, device_id, child_name, device_name, app_name, executable_path, pid, event_id, status, decision, created_at, decided_at, kind, requested_minutes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
       for (const request of this.state.approvalRequests) {
-        approvalInsert.run(request.id, request.deviceId, request.childName || "자녀", request.deviceName || request.deviceId, request.appName || "unknown", request.executablePath || "", request.pid == null ? null : Number(request.pid), request.eventId || "", request.status || "pending", request.decision || null, request.createdAt || nowIso(), request.decidedAt || null);
+        approvalInsert.run(request.id, request.deviceId, request.childName || "자녀", request.deviceName || request.deviceId, request.appName || "unknown", request.executablePath || "", request.pid == null ? null : Number(request.pid), request.eventId || "", request.status || "pending", request.decision || null, request.createdAt || nowIso(), request.decidedAt || null, request.kind || "app_launch", request.requestedMinutes == null ? null : Number(request.requestedMinutes));
       }
       const policy = this.state.policy;
       this.db.prepare("INSERT INTO policies (policy_id, version, updated_at, expires_at, hash, canonical_hash, signature, key_id, rules_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(policy.policyId, Number(policy.version), policy.updatedAt, policy.expiresAt, policy.hash, policy.canonicalHash, policy.signature, policy.keyId, JSON.stringify(policy.rules));
@@ -1139,16 +1144,18 @@ class Store {
     return clone(this.state.childProfiles[childId]);
   }
 
-  registerChildDevice({ deviceId, publicKey, authMode, deviceName, childName, metadata = {} }) {
+  registerChildDevice({ deviceId, publicKey, authMode, deviceName, childName, platform = "android", metadata = {} }) {
     if (!/^[A-Za-z0-9._:-]{1,128}$/.test(String(deviceId || ""))) throw new StoreError("invalid_device_id", 400);
     if (typeof publicKey !== "string" || publicKey.length < 32 || publicKey.length > 8192) throw new StoreError("invalid_device_public_key", 400);
     try { crypto.createPublicKey({ key: Buffer.from(publicKey, "base64"), format: "der", type: "spki" }); } catch (_) { throw new StoreError("invalid_device_public_key", 400); }
     const current = this.state.devices[deviceId] || {};
+    // An unauthenticated register call must not replace an enrolled key (device takeover).
+    if (current.publicKey && current.publicKey !== publicKey) throw new StoreError("device_key_conflict", 409);
     const samePublicKey = current.publicKey && current.publicKey === publicKey;
     const registrationStatus = current.registrationStatus === "registered_paired" && samePublicKey
       ? "registered_paired" : "registered_unpaired";
     const device = this.upsertDevice(deviceId, {
-      platform: "android", deviceName: String(deviceName || deviceId).slice(0, 256),
+      platform: platform === "windows" ? "windows" : "android", deviceName: String(deviceName || deviceId).slice(0, 256),
       childName: String(childName || "자녀").slice(0, 256), publicKey, authMode: String(authMode || "android_keystore_ec_signature"),
       registrationStatus, registeredAt: current.registeredAt || nowIso(), metadata: metadata && typeof metadata === "object" ? clone(metadata) : {}
     });
@@ -1223,6 +1230,10 @@ class Store {
     } else {
       throw new StoreError("invalid_pairing_issuer", 400);
     }
+    // A confirmed child cannot be moved into another family by scanning a new QR (e.g. a
+    // self-enrolled "parent" app); a second parent of the same family is still allowed.
+    const existingFamily = this.familyIdForDevice(targetChildDeviceId);
+    if (existingFamily && existingFamily !== targetFamilyId) throw new StoreError("child_already_paired", 409);
     const mapping = this.createParentChildMapping({ familyId: targetFamilyId, parentId: targetParentId, childDeviceId: targetChildDeviceId });
     session.status = "claimed";
     session.parentId = targetParentId;
@@ -1776,9 +1787,40 @@ class Store {
       });
     }
     this.state.events.push(...stored);
-    this.state.events = this.state.events.slice(-2000);
+    this.state.events = this.state.events.slice(-Number(process.env.CPSM_EVENT_RETENTION || 4000));
     this.save();
     return clone(stored);
+  }
+
+  familyIdForDevice(deviceId) {
+    const registration = this.getRegistrationStatus(deviceId);
+    const confirmed = registration.mappings.find((mapping) => mapping.status === "confirmed");
+    return confirmed ? confirmed.familyId : null;
+  }
+
+  familyDeviceIds(familyId) {
+    const target = String(familyId || "");
+    if (!target) return [];
+    const ids = new Set();
+    for (const mapping of Object.values(this.state.parentChildMappings || {})) {
+      if (mapping.familyId !== target || mapping.status !== "confirmed") continue;
+      const child = this.state.childProfiles[mapping.childId];
+      if (child && child.deviceId && this.state.devices[child.deviceId]) ids.add(child.deviceId);
+    }
+    return [...ids];
+  }
+
+  dashboardForFamily(familyId) {
+    const deviceIds = new Set(this.familyDeviceIds(familyId));
+    const familyPolicy = this.getFamilyPolicy(familyId);
+    const policy = familyPolicy && familyPolicy.policy ? familyPolicy.policy : { rules: [] };
+    return {
+      policy: clone(policy),
+      devices: [...deviceIds].map((deviceId) => clone(this.state.devices[deviceId])),
+      pendingRequests: clone(this.state.approvalRequests.filter((request) => request.status === "pending" && deviceIds.has(request.deviceId)).slice(-50).reverse()),
+      recentEvents: clone(this.state.events.filter((event) => deviceIds.has(event.deviceId)).slice(-100).reverse()),
+      blockedApps: clone(policy.rules || [])
+    };
   }
 
   dashboard() {
@@ -1804,6 +1846,9 @@ class Store {
       executablePath: String(event.payload && event.payload.executablePath || "").slice(0, 2048),
       pid: event.payload && event.payload.pid != null ? Number(event.payload.pid) : null,
       eventId: event.eventId || event.id,
+      kind: event.type === "time_request" ? "screen_time" : "app_launch",
+      requestedMinutes: event.type === "time_request"
+        ? Math.min(240, Math.max(1, Number(event.payload && event.payload.minutes) || 30)) : null,
       createdAt: nowIso(),
       decidedAt: null,
       decision: null
@@ -1960,11 +2005,13 @@ class Store {
     return family ? clone(family) : null;
   }
 
-  replaceFamilyPolicyRules(familyId, rules) {
+  // screenTime === undefined keeps the current value so rule-only clients cannot erase it.
+  replaceFamilyPolicyRules(familyId, rules, screenTime = undefined) {
     const family = this.ensureFamily(familyId, "CPSM Family");
     const current = this.state.familyPolicies[family.familyId] || { version: 0, policy: {} };
     const nextVersion = Number(current.version || 0) + 1;
     const now = nowIso();
+    const nextScreenTime = screenTime === undefined ? (current.policy && current.policy.screenTime) || null : screenTime;
     this.state.familyPolicies[family.familyId] = {
       familyId: family.familyId,
       version: nextVersion,
@@ -1973,7 +2020,8 @@ class Store {
         version: nextVersion,
         updatedAt: now,
         expiresAt: new Date(Date.now() + this.policyTtlMs).toISOString(),
-        rules: clone(rules)
+        rules: clone(rules),
+        ...(nextScreenTime ? { screenTime: clone(nextScreenTime) } : {})
       },
       source: "parent",
       updatedAt: now
@@ -2009,14 +2057,17 @@ class Store {
         name: rule.name,
         match: rule.match,
         action: rule.action || "block",
-        reason: rule.reason || "parent_rule"
+        reason: rule.reason || "parent_rule",
+        ...(Number(rule.dailyLimitMinutes || 0) > 0 ? { dailyLimitMinutes: Number(rule.dailyLimitMinutes) } : {})
       }));
+    const screenTime = selectedFamilyPolicy ? screenTimeForPlatform(source.screenTime, platform) : null;
     const payload = {
       policyId: source.policyId || this.state.policy.policyId,
       version: Number(source.version || selectedFamilyPolicy?.version || this.state.policy.version),
       timezone: "Asia/Seoul",
       enforcementMode: "enforce",
       appRules: rules,
+      ...(screenTime ? { schemaVersion: 2, screenTime } : {}),
       expiresAt: source.expiresAt || this.state.policy.expiresAt
     };
     const canonicalHash = crypto.createHash("sha256").update(canonicalJson(payload)).digest("hex");

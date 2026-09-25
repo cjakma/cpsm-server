@@ -5,6 +5,10 @@ const { Store, StoreError } = require("./store");
 const { FcmSender } = require("./fcm");
 const { Authenticator, AuthError } = require("./auth");
 const { ArtifactStore, ArtifactError } = require("./artifacts");
+const { ScreenTimeError, sanitizeDeviceCommand, sanitizeScreenTime } = require("./screenTime");
+
+const ONLINE_WINDOW_MS = 3 * 60 * 1000;
+const STALE_WINDOW_MS = 30 * 60 * 1000;
 
 const MAX_BODY_BYTES = Number(process.env.CPSM_MAX_BODY_BYTES || 512 * 1024);
 
@@ -131,12 +135,17 @@ function sanitizeRules(rules) {
       : "monitor";
     const name = String(rule.name || rule.processName || rule.packageName || "rule").slice(0, 256);
     if (!name.trim()) throw new StoreError("rule_name_required", 400);
+    const dailyLimitMinutes = Number(rule.dailyLimitMinutes || rule.daily_limit_minutes || 0);
+    if (!Number.isInteger(dailyLimitMinutes) || dailyLimitMinutes < 0 || dailyLimitMinutes > 1440) {
+      throw new StoreError("invalid_rule_daily_limit", 400);
+    }
     return {
       id: String(rule.id || crypto.randomUUID()).slice(0, 128),
       name,
       platform,
       match,
       action,
+      ...(dailyLimitMinutes > 0 ? { dailyLimitMinutes } : {}),
       excludedUntil: String(rule.excludedUntil || "").slice(0, 64),
       reason: String(rule.reason || "parent_policy").slice(0, 256)
     };
@@ -191,6 +200,53 @@ async function notifyParentForEvent(fcm, event, request) {
     title: `${childName || "자녀"} 앱 이벤트`,
     body: `${childName || "자녀"}가 ${appName}을 실행했습니다.`
   });
+}
+
+// Screen-time requests are answered with bonus minutes; app-launch requests keep the
+// original temporary-allow / terminate commands.
+function approvalAllowCommand(store, request, idempotencyKey) {
+  if (request.kind === "screen_time") {
+    return store.queueCommand(request.deviceId, "screen_time.bonus", { minutes: Number(request.requestedMinutes || 30), requestId: request.id, issuedAt: new Date().toISOString() }, { idempotencyKey, expiryMs: 60 * 60 * 1000 });
+  }
+  return store.queueCommand(request.deviceId, "app.allow.temporary", { processName: request.appName, minutes: 120, requestId: request.id }, { idempotencyKey });
+}
+
+function approvalDenyCommand(store, request, idempotencyKey) {
+  if (request.kind === "screen_time") return null;
+  return store.queueCommand(request.deviceId, "app.terminate", { pid: request.pid, processName: request.appName, requestId: request.id }, { idempotencyKey });
+}
+
+// Parent-facing summary. Presence is derived from the last authenticated sync so a child
+// that powers off, loses network or kills the agent shows up as stale/offline.
+function deviceSummary(store, deviceId) {
+  const device = store.state.devices[deviceId] || {};
+  const health = device.health && typeof device.health === "object" ? device.health : {};
+  const lastSeenMs = Date.parse(device.lastSeenAt || "") || 0;
+  const ageMs = lastSeenMs ? Date.now() - lastSeenMs : null;
+  const presence = ageMs === null ? "unknown" : (ageMs <= ONLINE_WINDOW_MS ? "online" : (ageMs <= STALE_WINDOW_MS ? "stale" : "offline"));
+  const protection = health.protection && typeof health.protection === "object" ? health.protection : {};
+  return {
+    device_id: deviceId,
+    platform: device.platform || "unknown",
+    device_name: device.deviceName || deviceId,
+    child_name: device.childName || "",
+    presence,
+    last_seen_at: device.lastSeenAt || null,
+    last_seen_age_ms: ageMs,
+    local_policy_version: Number(device.localPolicyVersion || 0),
+    current_app: device.currentApp || "",
+    screen_time: health.screen_time && typeof health.screen_time === "object" ? health.screen_time : null,
+    protection: {
+      level: String(protection.level || "unknown"),
+      reasons: Array.isArray(protection.reasons) ? protection.reasons.slice(0, 10) : [],
+      accessibility: protection.accessibility === undefined ? null : Boolean(protection.accessibility),
+      device_owner: health.device_owner === undefined ? null : Boolean(health.device_owner),
+      usage_access: health.usage_access === undefined ? null : Boolean(health.usage_access),
+      boot_guard_gap_ms: protection.boot_guard_gap_ms === undefined ? null : Number(protection.boot_guard_gap_ms)
+    },
+    compatibility: device.platform === "android" ? androidCompatibility(device.metadata || {}) : null,
+    metadata: device.metadata || {}
+  };
 }
 
 async function main() {
@@ -393,6 +449,7 @@ async function main() {
           authMode: value.auth_mode,
           deviceName: value.device_name || value.deviceName,
           childName: value.child_name || value.childName,
+          platform: value.platform === "windows" ? "windows" : "android",
           metadata: {
             wifi_ip: String(metadata.wifi_ip || metadata.requested_wifi_ip || "").slice(0, 64),
             phone_number: String(metadata.phone_number || "").slice(0, 64),
@@ -404,7 +461,10 @@ async function main() {
             os_release: String(metadata.os_release || "").slice(0, 64),
             security_patch: String(metadata.security_patch || "").slice(0, 64),
             app_version_code: Number(metadata.app_version_code || 0) || 0,
-            app_version_name: String(metadata.app_version_name || "").slice(0, 128)
+            app_version_name: String(metadata.app_version_name || "").slice(0, 128),
+            windows_release: String(metadata.windows_release || "").slice(0, 64),
+            windows_build: String(metadata.windows_build || "").slice(0, 64),
+            hostname: String(metadata.hostname || "").slice(0, 128)
           }
         });
         store.audit("child", deviceId, "child_device_registered", req.headers["x-request-id"] || null, { registrationStatus: registration.registrationStatus });
@@ -552,10 +612,40 @@ async function main() {
           lastEventSeq: Number(value.last_event_seq || 0),
           health: status.health && typeof status.health === "object" ? status.health : {}
         });
+        // Android queues events locally and uploads them with sync; ack the highest sequence seen.
+        let acceptedEventSeq = -1;
+        if (Array.isArray(value.events) && value.events.length) {
+          const mapped = [];
+          for (const event of value.events.slice(0, 100)) {
+            const seq = Number(event && event.seq);
+            if (!Number.isInteger(seq) || seq <= 0) continue;
+            acceptedEventSeq = Math.max(acceptedEventSeq, seq);
+            const type = String(event.type || "unknown").slice(0, 64);
+            if (type === "health_check") continue; // current health travels in status.health
+            const timestamp = Number(event.timestamp_ms);
+            mapped.push({
+              eventId: `seq-${seq}`,
+              sequence: seq,
+              type: type === "foreground_app" ? "app.foreground" : type,
+              eventTime: new Date(Number.isFinite(timestamp) && timestamp > 0 ? timestamp : Date.now()).toISOString(),
+              payload: type === "foreground_app"
+                ? { packageName: String(event.package_name || "").slice(0, 256) }
+                : (event.details && typeof event.details === "object" && !Array.isArray(event.details) ? event.details : {})
+            });
+          }
+          const stored = mapped.length ? store.addEvents(deviceId, mapped) : [];
+          // A child's "more time" request becomes a parent approval request (deduplicated by event id).
+          for (const event of stored.filter((item) => item.type === "time_request")) {
+            if (!store.state.approvalRequests.some((request) => request.eventId === event.eventId && request.deviceId === deviceId)) {
+              store.createApprovalRequest(deviceId, { ...event, payload: { ...event.payload, appName: "추가 사용시간" } });
+            }
+          }
+        }
         const commands = store.pollCommands(deviceId);
         const registration = store.getRegistrationStatus(deviceId);
         const policyReceipt = store.recordPolicySyncReceipt(deviceId, status.policy && typeof status.policy === "object" ? status.policy : {});
-        const androidPolicyBlocked = device.platform === "android" && !registration.policyReady;
+        // Self-registered (key-based) children of any platform stay gated until the relationship is confirmed.
+        const androidPolicyBlocked = (device.platform === "android" || Boolean(registration.child)) && !registration.policyReady;
         const signedPolicy = androidPolicyBlocked ? null : store.getSignedPolicy(deviceId);
         sendJson(res, 200, {
           ok: true,
@@ -583,6 +673,7 @@ async function main() {
             download_url: `/api/devices/${encodeURIComponent(deviceId)}/policy?version=${signedPolicy.version}`
           },
           commands,
+          accepted_event_seq: acceptedEventSeq,
           next_sync_after_ms: 30000 + Math.floor(Math.random() * 15000)
         });
         return;
@@ -594,7 +685,7 @@ async function main() {
         auth.requireDevice(req, deviceId, requestPath, body.raw);
         const registration = store.getRegistrationStatus(deviceId);
         const device = store.state.devices[deviceId];
-        if (device && device.platform === "android" && !registration.policyReady) {
+        if (device && (device.platform === "android" || registration.child) && !registration.policyReady) {
           sendJson(res, 409, { ok: false, error: "policy_not_ready", reason: registration.relationshipStatus === "unpaired" ? "parent_mapping_required" : "mutual_consent_required" });
           return;
         }
@@ -772,6 +863,14 @@ async function main() {
         if (!parentSession || !parentSession.parent_id) throw new StoreError("parent_session_profile_required", 403);
         return parentSession;
       };
+      // A self-enrolled parent session only reaches devices confirmed into its own family.
+      // Static operator tokens (no session) keep the legacy global view.
+      const canAccessDevice = (deviceId) => !parentSession
+        || Boolean(parentSession.family_id && store.familyIdForDevice(deviceId) === parentSession.family_id);
+      const requireDeviceAccess = (deviceId) => {
+        if (!store.state.devices[deviceId] || !canAccessDevice(deviceId)) throw new StoreError("device_not_found", 404);
+      };
+      const familyScope = parentSession && parentSession.family_id ? parentSession.family_id : null;
       if (req.method === "POST" && pathname === "/api/parent/pairing-sessions") {
         const session = requireParentProfile();
         const pairing = store.createPairingSession({ issuerType: "parent", issuerId: session.parent_id, familyId: session.family_id });
@@ -880,6 +979,7 @@ async function main() {
       const parentDevice = pathname.match(/^\/api\/parent\/devices\/([^/]+)\/(health|timeline)$/);
       if (req.method === "GET" && parentDevice) {
         const deviceId = normalizeDeviceId(parentDevice[1]);
+        requireDeviceAccess(deviceId);
         if (parentDevice[2] === "health") {
           sendJson(res, 200, { device: store.state.devices[deviceId] || null });
         } else {
@@ -891,7 +991,8 @@ async function main() {
       const approvalRead = pathname.match(/^\/api\/parent\/approval-requests\/([^/]+)$/);
       if (req.method === "GET" && approvalRead) {
         const request = store.state.approvalRequests.find((item) => item.id === decodeURIComponent(approvalRead[1]));
-        sendJson(res, request ? 200 : 404, request ? request : { ok: false, error: "request_not_found" });
+        const visible = request && canAccessDevice(request.deviceId);
+        sendJson(res, visible ? 200 : 404, visible ? request : { ok: false, error: "request_not_found" });
         return;
       }
 
@@ -900,23 +1001,25 @@ async function main() {
         const requestId = decodeURIComponent(approvalDecision[1]);
         const decision = value.decision === "allow" ? "allow" : (value.decision === "terminate" ? "terminate" : "");
         if (!decision) throw new StoreError("invalid_decision", 400);
+        const target = store.state.approvalRequests.find((item) => item.id === requestId);
+        if (!target || !canAccessDevice(target.deviceId)) throw new StoreError("request_not_found", 404);
         const request = store.decideApprovalRequest(requestId, decision);
         if (!request) {
           sendJson(res, 404, { ok: false, error: "request_not_found" });
           return;
         }
         const command = decision === "allow"
-          ? store.queueCommand(request.deviceId, "app.allow.temporary", { processName: request.appName, minutes: 120, requestId }, { idempotencyKey: String(value.idempotency_key || requestId) })
-          : store.queueCommand(request.deviceId, "app.terminate", { pid: request.pid, processName: request.appName, requestId }, { idempotencyKey: String(value.idempotency_key || requestId) });
+          ? approvalAllowCommand(store, request, String(value.idempotency_key || requestId))
+          : approvalDenyCommand(store, request, String(value.idempotency_key || requestId));
         sendJson(res, 200, { ok: true, request, command });
         return;
       }
       if (req.method === "GET" && pathname === "/api/parent/approval-requests") {
-        sendJson(res, 200, { requests: store.state.approvalRequests.slice().reverse() });
+        sendJson(res, 200, { requests: store.state.approvalRequests.filter((request) => canAccessDevice(request.deviceId)).reverse() });
         return;
       }
       if (req.method === "GET" && pathname === "/api/parent/dashboard") {
-        sendJson(res, 200, store.dashboard());
+        sendJson(res, 200, parentSession ? store.dashboardForFamily(familyScope || "") : store.dashboard());
         return;
       }
       if (req.method === "GET" && pathname === "/api/parent/policies/current") {
@@ -928,11 +1031,14 @@ async function main() {
       if ((req.method === "POST" && pathname === "/api/parent/policies")
           || (req.method === "PUT" && pathname === "/api/parent/policies/current")) {
         const rules = sanitizeRules(value.rules || []);
-        const familyPolicy = parentSession && parentSession.family_id && parentSession.parent_id
-          ? store.replaceFamilyPolicyRules(parentSession.family_id, rules) : null;
+        const screenTime = sanitizeScreenTime(value.screenTime !== undefined ? value.screenTime : value.screen_time);
+        if (parentSession && !(parentSession.family_id && parentSession.parent_id)) throw new StoreError("parent_session_profile_required", 403);
+        const familyPolicy = parentSession
+          ? store.replaceFamilyPolicyRules(parentSession.family_id, rules, screenTime) : null;
         if (!familyPolicy) store.replacePolicyRules(rules);
         const policyRefreshVersion = familyPolicy ? familyPolicy.version : store.state.policy.version;
-        for (const deviceId of Object.keys(store.state.devices)) {
+        const refreshTargets = familyPolicy ? store.familyDeviceIds(familyPolicy.familyId) : Object.keys(store.state.devices);
+        for (const deviceId of refreshTargets) {
           store.queueCommand(deviceId, "policy.refresh", {}, { idempotencyKey: `policy-${policyRefreshVersion}-${deviceId}` });
         }
         const policy = familyPolicy && familyPolicy.policy ? familyPolicy.policy : store.state.policy;
@@ -944,19 +1050,59 @@ async function main() {
       if (req.method === "POST" && approvalAction) {
         const requestId = decodeURIComponent(approvalAction[1]);
         const action = approvalAction[2];
+        const target = store.state.approvalRequests.find((item) => item.id === requestId);
+        if (!target || !canAccessDevice(target.deviceId)) throw new StoreError("request_not_found", 404);
         const request = store.decideApprovalRequest(requestId, action);
         if (!request) {
           sendJson(res, 404, { ok: false, error: "request_not_found" });
           return;
         }
         const command = action === "allow"
-          ? store.queueCommand(request.deviceId, "app.allow.temporary", { processName: request.appName, minutes: 120, requestId }, { idempotencyKey: requestId })
-          : store.queueCommand(request.deviceId, "app.terminate", { pid: request.pid, processName: request.appName, requestId }, { idempotencyKey: requestId });
+          ? approvalAllowCommand(store, request, requestId)
+          : approvalDenyCommand(store, request, requestId);
         sendJson(res, 200, { ok: true, request, command });
         return;
       }
       if (req.method === "GET" && pathname === "/api/parent/blocked-apps") {
-        sendJson(res, 200, { blockedApps: store.state.policy.rules });
+        const familyPolicy = familyScope ? store.getFamilyPolicy(familyScope) : null;
+        sendJson(res, 200, { blockedApps: parentSession ? ((familyPolicy && familyPolicy.policy.rules) || []) : store.state.policy.rules });
+        return;
+      }
+      if (req.method === "POST" && pathname === "/api/parent/blocked-apps" && parentSession) {
+        const session = requireParentProfile();
+        const rule = sanitizeRules([{ ...value, id: value.id || crypto.randomUUID() }])[0];
+        const current = store.getFamilyPolicy(session.family_id);
+        const rules = ((current && current.policy.rules) || []).filter((item) => item.id !== rule.id).concat([rule]);
+        const familyPolicy = store.replaceFamilyPolicyRules(session.family_id, rules);
+        for (const deviceId of store.familyDeviceIds(session.family_id)) {
+          store.queueCommand(deviceId, "policy.refresh", {}, { idempotencyKey: `policy-${familyPolicy.version}-${deviceId}` });
+        }
+        sendJson(res, 200, { ok: true, rule });
+        return;
+      }
+      if (req.method === "GET" && pathname === "/api/parent/devices") {
+        const deviceIds = familyScope ? store.familyDeviceIds(familyScope) : (parentSession ? [] : Object.keys(store.state.devices));
+        sendJson(res, 200, { devices: deviceIds.map((deviceId) => deviceSummary(store, deviceId)) });
+        return;
+      }
+      const parentDeviceCommands = pathname.match(/^\/api\/parent\/devices\/([^/]+)\/commands$/);
+      if (parentDeviceCommands && req.method === "POST") {
+        const deviceId = normalizeDeviceId(parentDeviceCommands[1]);
+        requireDeviceAccess(deviceId);
+        const { type, payload } = sanitizeDeviceCommand(value);
+        const idempotencyKey = value.idempotency_key ? String(value.idempotency_key).slice(0, 128) : crypto.randomUUID();
+        // A lock must survive a long offline period; the child persists it locally once delivered.
+        const command = store.queueCommand(deviceId, type, { ...payload, issuedAt: new Date().toISOString() }, {
+          idempotencyKey, expiryMs: type === "device.lock" ? 24 * 60 * 60 * 1000 : 60 * 60 * 1000
+        });
+        store.audit("parent", parentSession ? parentSession.parent_id : "operator", "device_command_queued", req.headers["x-request-id"] || null, { deviceId, type, commandId: command.id });
+        sendJson(res, 201, { ok: true, command });
+        return;
+      }
+      if (parentDeviceCommands && req.method === "GET") {
+        const deviceId = normalizeDeviceId(parentDeviceCommands[1]);
+        requireDeviceAccess(deviceId);
+        sendJson(res, 200, { commands: store.state.commands.filter((command) => command.deviceId === deviceId).slice(-20).reverse() });
         return;
       }
       if (req.method === "POST" && pathname === "/api/parent/blocked-apps") {
@@ -972,12 +1118,10 @@ async function main() {
 
       sendJson(res, 404, { ok: false, error: "not_found" });
     } catch (error) {
-      const status = error instanceof AuthError || error instanceof StoreError || error instanceof ArtifactError
-        ? error.status
-        : 500;
-      const code = error instanceof AuthError || error instanceof StoreError || error instanceof ArtifactError
-        ? error.code
-        : "internal_error";
+      const known = error instanceof AuthError || error instanceof StoreError
+        || error instanceof ArtifactError || error instanceof ScreenTimeError;
+      const status = known ? error.status : 500;
+      const code = known ? error.code : "internal_error";
       if (status >= 500) log.error("request.failed", { code });
       sendJson(res, status, { ok: false, error: code });
     }

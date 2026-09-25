@@ -151,7 +151,8 @@ class Authenticator {
       ? [this.adminToken]
       : [this.parentToken, this.adminToken];
     const token = this.bearerToken(req);
-    const sessionValid = this.store && typeof this.store.validateParentSession === "function"
+    // Self-enrolled parent sessions never satisfy admin scope.
+    const sessionValid = kind === "parent" && this.store && typeof this.store.validateParentSession === "function"
       ? this.store.validateParentSession(token)
       : false;
     if (sessionValid) return { actor: "parent-session" };

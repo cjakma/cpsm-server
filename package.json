@@ -8,9 +8,10 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node src/index.js --dev",
-    "check": "node --check src/index.js && node --check src/store.js && node --check src/fcm.js && node --check src/artifacts.js && node --check scripts/publish-artifact.js",
+    "check": "node --check src/index.js && node --check src/store.js && node --check src/fcm.js && node --check src/artifacts.js && node --check scripts/publish-artifact.js && node --check src/auth.js && node --check src/screenTime.js && node --check scripts/policy-v2-test.js",
     "firebase:android-config": "node scripts/firebase-android-config.js",
-    "smoke": "node scripts/smoke-test.js"
+    "smoke": "node scripts/smoke-test.js",
+    "test:v2": "node scripts/policy-v2-test.js"
   },
   "license": "UNLICENSED"
 }
