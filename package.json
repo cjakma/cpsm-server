@@ -8,7 +8,7 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node src/index.js --dev",
-    "check": "node --check src/index.js && node --check src/store.js && node --check src/fcm.js",
+    "check": "node --check src/index.js && node --check src/store.js && node --check src/fcm.js && node --check src/artifacts.js && node --check scripts/publish-artifact.js",
     "firebase:android-config": "node scripts/firebase-android-config.js",
     "smoke": "node scripts/smoke-test.js"
   },

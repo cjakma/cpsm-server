@@ -1,12 +1,17 @@
 const http = require("http");
 const path = require("path");
 const crypto = require("crypto");
-const { Store } = require("./store");
+const { Store, StoreError } = require("./store");
 const { FcmSender } = require("./fcm");
+const { Authenticator, AuthError } = require("./auth");
+const { ArtifactStore, ArtifactError } = require("./artifacts");
+
+const MAX_BODY_BYTES = Number(process.env.CPSM_MAX_BODY_BYTES || 512 * 1024);
 
 function parseArgs(args) {
   const parsed = {
     port: Number(process.env.PORT || 18732),
+    host: process.env.CPSM_SERVER_HOST || "127.0.0.1",
     dataDir: process.env.CPSM_SERVER_DATA_DIR || path.join(process.cwd(), "data"),
     dev: false
   };
@@ -14,12 +19,18 @@ function parseArgs(args) {
     if (args[index] === "--port") {
       parsed.port = Number(args[index + 1]);
       index += 1;
+    } else if (args[index] === "--host") {
+      parsed.host = args[index + 1] || parsed.host;
+      index += 1;
     } else if (args[index] === "--data-dir") {
       parsed.dataDir = args[index + 1];
       index += 1;
     } else if (args[index] === "--dev") {
       parsed.dev = true;
     }
+  }
+  if (!Number.isInteger(parsed.port) || parsed.port < 1 || parsed.port > 65535) {
+    throw new Error("invalid_port");
   }
   return parsed;
 }
@@ -33,70 +44,148 @@ function logger() {
 }
 
 function sendJson(res, status, body) {
-  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-  res.end(JSON.stringify(body, null, 2));
+  if (res.headersSent) {
+    res.end();
+    return;
+  }
+  res.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff"
+  });
+  res.end(JSON.stringify(body));
 }
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let data = "";
+    let rejected = false;
     req.setEncoding("utf8");
-    req.on("data", (chunk) => { data += chunk; });
-    req.on("end", () => {
-      try {
-        resolve(data ? JSON.parse(data) : {});
-      } catch (error) {
-        reject(error);
+    req.on("data", (chunk) => {
+      if (rejected) return;
+      data += chunk;
+      if (Buffer.byteLength(data, "utf8") > MAX_BODY_BYTES) {
+        rejected = true;
+        reject(new StoreError("request_body_too_large", 413));
+        req.resume();
       }
+    });
+    req.on("end", () => {
+      if (rejected) return;
+      if (!data) {
+        resolve({ raw: "", value: {} });
+        return;
+      }
+      try {
+        resolve({ raw: data, value: JSON.parse(data) });
+      } catch (_) {
+        reject(new StoreError("invalid_json", 400));
+      }
+    });
+    req.on("error", (error) => {
+      if (!rejected) reject(error);
     });
   });
 }
 
-function makePolicyFromBlockedApps(store, deviceId) {
-  const platform = store.state.devices[deviceId] && store.state.devices[deviceId].platform
-    ? store.state.devices[deviceId].platform
-    : "windows";
-  const rules = store.state.policy.rules
-    .filter((rule) => !rule.platform || rule.platform === platform)
-    .filter((rule) => !rule.excludedUntil || Date.parse(rule.excludedUntil) < Date.now());
+function bodyObject(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw new StoreError("invalid_body", 400);
+  }
+  return body;
+}
 
+function androidCompatibility(metadata = {}) {
+  const apiLevel = Number(metadata.android_api_level || 0);
+  if (!apiLevel) return { status: "unknown", apiLevel: 0, minSupportedApi: 26, testedThroughApi: 36 };
   return {
-    policyId: store.state.policy.policyId,
-    version: store.state.policy.version,
-    hash: store.state.policy.hash,
-    timezone: "Asia/Seoul",
-    enforcementMode: "enforce",
-    appRules: rules.map((rule) => ({
-      id: rule.id,
-      platform: rule.platform,
-      name: rule.name,
-      match: rule.match,
-      action: rule.action || "block",
-      reason: rule.reason || "parent_rule"
-    }))
+    status: apiLevel < 26 ? "unsupported" : (apiLevel <= 36 ? "supported" : "review_required"),
+    apiLevel,
+    minSupportedApi: 26,
+    testedThroughApi: 36,
+    updateVerifier: apiLevel < 28 ? "legacy_signatures" : "signing_info"
   };
 }
 
-function jitteredSyncMs() {
-  return 30000 + Math.floor(Math.random() * 15000);
+function publicKeyPem(store) {
+  return store.publicKey && store.publicKey.export({ type: "spki", format: "pem" });
+}
+
+function sanitizeRules(rules) {
+  if (!Array.isArray(rules) || rules.length > 500) {
+    throw new StoreError("invalid_rules", 400);
+  }
+  return rules.map((rule) => {
+    if (!rule || typeof rule !== "object" || Array.isArray(rule)) {
+      throw new StoreError("invalid_rule", 400);
+    }
+    const platform = rule.platform === "android" ? "android" : "windows";
+    const match = rule.match && typeof rule.match === "object" ? rule.match : {
+      type: platform === "android" ? "package" : "processName",
+      ...(platform === "android"
+        ? { packageName: String(rule.packageName || rule.processName || "") }
+        : { processName: String(rule.processName || rule.name || "") })
+    };
+    const action = ["monitor", "block", "require_approval", "allow"].includes(rule.action)
+      ? rule.action
+      : "monitor";
+    const name = String(rule.name || rule.processName || rule.packageName || "rule").slice(0, 256);
+    if (!name.trim()) throw new StoreError("rule_name_required", 400);
+    return {
+      id: String(rule.id || crypto.randomUUID()).slice(0, 128),
+      name,
+      platform,
+      match,
+      action,
+      excludedUntil: String(rule.excludedUntil || "").slice(0, 64),
+      reason: String(rule.reason || "parent_policy").slice(0, 256)
+    };
+  });
+}
+
+function normalizeDeviceId(value) {
+  const deviceId = decodeURIComponent(String(value || ""));
+  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(deviceId)) {
+    throw new StoreError("invalid_device_id", 400);
+  }
+  return deviceId;
+}
+
+function publicUpdateSelector(requestUrl) {
+  const platform = String(requestUrl.searchParams.get("platform") || "");
+  const product = String(requestUrl.searchParams.get("product") || "");
+  const expectedPlatform = {
+    "android:cpsm-m": "android",
+    "android:cpsm-p": "android",
+    "windows:cpsm-c": "windows"
+  }[`${platform}:${product}`];
+  if (!expectedPlatform || expectedPlatform !== platform) {
+    throw new ArtifactError("invalid_update_selector", 400);
+  }
+  return { platform, product };
+}
+
+function bootstrapMatches(value) {
+  const expected = String(process.env.CPSM_BOOTSTRAP_CODE || "");
+  const supplied = String(value || "");
+  if (!expected || supplied.length !== expected.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(supplied, "utf8"), Buffer.from(expected, "utf8"));
 }
 
 async function notifyParentForEvent(fcm, event, request) {
   const payload = event.payload || {};
   const childName = request ? request.childName : event.childName;
   const appName = request ? request.appName : (payload.appName || "앱");
-  const type = request ? "cpsm_app_launch_request" : "cpsm_app_event";
-  await fcm.sendToParents({
-    type,
+  return fcm.sendToParents({
+    type: request ? "cpsm_app_launch_request" : "cpsm_app_event",
     request_id: request ? request.id : "",
-    event_id: event.id,
+    event_id: event.id || event.eventId,
     device_id: event.deviceId,
     child_name: childName || "자녀",
     device_name: request ? request.deviceName : "",
     app_name: appName,
     action: payload.action || "",
     matched_rule_id: payload.matchedRuleId || payload.ruleId || "",
-    executable_path: payload.executablePath || "",
     pid: String(payload.pid || "")
   }, {
     title: `${childName || "자녀"} 앱 이벤트`,
@@ -109,151 +198,749 @@ async function main() {
   const log = logger();
   const store = new Store(path.resolve(options.dataDir));
   const fcm = new FcmSender(store, log);
+  const auth = new Authenticator({ store, dev: options.dev });
+  const artifacts = new ArtifactStore(
+    process.env.CPSM_ARTIFACTS_DIR || path.join(process.cwd(), "artifacts")
+  );
 
   const server = http.createServer(async (req, res) => {
+    const requestUrl = new URL(req.url, "http://localhost");
+    const rawPathname = requestUrl.pathname;
+    const pathname = rawPathname.startsWith("/v1/parent")
+      ? `/api/parent${rawPathname.slice("/v1/parent".length)}`
+      : rawPathname;
+    const requestPathPrefix = String(req.headers["x-forwarded-prefix"] || "").trim().replace(/\/$/, "");
+    const requestPath = `${requestPathPrefix}${rawPathname}${requestUrl.search}`;
+    let body = { raw: "", value: {} };
     try {
-      const url = new URL(req.url, "http://localhost");
+      if (["POST", "PUT", "PATCH"].includes(req.method)) body = await readBody(req);
+      const value = bodyObject(body.value);
 
-      if (req.method === "GET" && url.pathname === "/api/status") {
+      if (req.method === "GET" && pathname === "/api/status") {
         sendJson(res, 200, {
           ok: true,
           service: "cpsm-server",
-          parentTokens: store.state.parentTokens.length,
+          storage: store.storageMode(),
           devices: Object.keys(store.state.devices).length,
-          pendingCommands: store.state.commands.filter((command) => command.status === "queued").length,
+          pendingCommands: store.state.commands.filter((command) => ["queued", "delivered"].includes(command.state)).length,
           policyVersion: store.state.policy.version,
-          fcmEnabled: fcm.enabled()
+          fcmEnabled: fcm.enabled(),
+          authMode: auth.mode
         });
         return;
       }
 
-      if (req.method === "POST" && url.pathname === "/api/admin/portal-device/token") {
-        const body = await readBody(req);
-        store.registerParentToken(body.fcm_token || body.token);
+      // Bootstrap update endpoints are deliberately read-only and unauthenticated. They allow a
+      // freshly installed client to compare/download a signed artifact before its device key has
+      // been enrolled. Registered clients continue to use the authenticated device/parent routes.
+      const stableAndroidUpdate = pathname.match(/^\/api\/updates\/android\/(cpsm-m|cpsm-p)\/(manifest\.json|latest\.apk)$/);
+      if (req.method === "GET" && stableAndroidUpdate) {
+        const product = stableAndroidUpdate[1];
+        const resource = stableAndroidUpdate[2];
+        if (resource === "manifest.json") {
+          artifacts.sendManifest(res, "android", product, `/api/updates/android/${product}/latest.apk`);
+        } else {
+          artifacts.sendArtifact(res, "android", product);
+        }
+        return;
+      }
+
+      if (req.method === "GET" && pathname === "/api/updates/manifest") {
+        const { platform, product } = publicUpdateSelector(requestUrl);
+        artifacts.sendManifest(
+          res,
+          platform,
+          product,
+          `/api/updates/download?platform=${encodeURIComponent(platform)}&product=${encodeURIComponent(product)}`
+        );
+        return;
+      }
+
+      if (req.method === "GET" && pathname === "/api/updates/download") {
+        const { platform, product } = publicUpdateSelector(requestUrl);
+        artifacts.sendArtifact(res, platform, product);
+        return;
+      }
+
+      if (req.method === "POST" && pathname === "/api/admin/portal-device/token") {
+        auth.requireAdmin(req);
+        store.registerParentToken(value.fcm_token || value.token);
         sendJson(res, 200, { ok: true, registered: true });
         return;
       }
 
-      const deviceEvents = url.pathname.match(/^\/api\/devices\/([^/]+)\/events$/);
+      if (pathname === "/api/admin/app-versions" && req.method === "GET") {
+        auth.requireAdmin(req);
+        const versions = store.listAppVersions({
+          platform: requestUrl.searchParams.get("platform") || "",
+          product: requestUrl.searchParams.get("product") || "",
+          limit: requestUrl.searchParams.get("limit") || 100
+        });
+        sendJson(res, 200, { ok: true, versions });
+        return;
+      }
+      if (pathname === "/api/admin/app-versions" && req.method === "POST") {
+        auth.requireAdmin(req);
+        const version = store.registerAppVersion(value);
+        sendJson(res, 201, { ok: true, version });
+        return;
+      }
+
+      if (pathname === "/api/admin/errors" && req.method === "GET") {
+        auth.requireAdmin(req);
+        const result = store.listDeviceErrors({
+          status: requestUrl.searchParams.get("status") || "",
+          product: requestUrl.searchParams.get("product") || "",
+          limit: requestUrl.searchParams.get("limit") || 100,
+          cursor: requestUrl.searchParams.get("cursor") || ""
+        });
+        sendJson(res, 200, { ok: true, errors: result.errors, next_cursor: result.nextCursor, total: result.total });
+        return;
+      }
+      const adminError = pathname.match(/^\/api\/admin\/errors\/([^/]+)$/);
+      if (adminError && req.method === "GET") {
+        auth.requireAdmin(req);
+        const error = store.getDeviceError(decodeURIComponent(adminError[1]));
+        if (!error) {
+          sendJson(res, 404, { ok: false, error: "error_not_found" });
+          return;
+        }
+        sendJson(res, 200, { ok: true, error });
+        return;
+      }
+      if (adminError && req.method === "PATCH") {
+        auth.requireAdmin(req);
+        sendJson(res, 200, { ok: true, error: store.updateDeviceError(decodeURIComponent(adminError[1]), value) });
+        return;
+      }
+
+      const versionChanges = pathname.match(/^\/api\/admin\/app-versions\/([^/]+)\/([^/]+)\/(\d+)\/changes$/);
+      if (versionChanges && req.method === "GET") {
+        auth.requireAdmin(req);
+        sendJson(res, 200, {
+          ok: true,
+          changes: store.listAppVersionChanges({ platform: decodeURIComponent(versionChanges[1]), product: decodeURIComponent(versionChanges[2]), versionCode: Number(versionChanges[3]) })
+        });
+        return;
+      }
+      if (versionChanges && req.method === "POST") {
+        auth.requireAdmin(req);
+        const change = store.createAppVersionChange({ ...value, platform: decodeURIComponent(versionChanges[1]), product: decodeURIComponent(versionChanges[2]), version_code: Number(versionChanges[3]) });
+        sendJson(res, 201, { ok: true, change });
+        return;
+      }
+      const versionChange = pathname.match(/^\/api\/admin\/app-versions\/([^/]+)\/([^/]+)\/(\d+)\/changes\/([^/]+)$/);
+      if (versionChange && req.method === "PATCH") {
+        auth.requireAdmin(req);
+        const change = store.verifyAppVersionChange(decodeURIComponent(versionChange[4]), {
+          verified: value.is_verified === true || value.verified === true,
+          verificationNote: value.verification_note || value.verificationNote || ""
+        });
+        sendJson(res, 200, { ok: true, change });
+        return;
+      }
+
+      if (req.method === "POST" && pathname === "/api/parent/auth/enroll") {
+        if (!process.env.CPSM_BOOTSTRAP_CODE) throw new AuthError("bootstrap_not_configured", 503);
+        if (!bootstrapMatches(value.bootstrap_code)) throw new AuthError("invalid_bootstrap_code", 401);
+        const familyId = String(value.family_id || `family-${String(value.device_fingerprint || "default").slice(0, 64)}`);
+        const metadata = value.metadata && typeof value.metadata === "object" ? value.metadata : {};
+        const parent = store.ensureParentProfile({
+          familyId,
+          deviceFingerprint: String(value.device_fingerprint || ""),
+          publicKey: String(value.device_pubkey || ""),
+          displayName: String(value.parent_name || "부모").slice(0, 256),
+          metadata: {
+            android_api_level: Number(metadata.android_api_level || 0) || 0,
+            os_release: String(metadata.os_release || "").slice(0, 64),
+            security_patch: String(metadata.security_patch || "").slice(0, 64),
+            manufacturer: String(metadata.manufacturer || "").slice(0, 128),
+            model: String(metadata.model || "").slice(0, 128),
+            device: String(metadata.device || "").slice(0, 128),
+            product: String(metadata.product || "").slice(0, 128),
+            app_version_code: Number(metadata.app_version_code || 0) || 0,
+            app_version_name: String(metadata.app_version_name || "").slice(0, 128)
+          }
+        });
+        const session = store.issueParentSession(
+          familyId,
+          Number(process.env.CPSM_PARENT_SESSION_TTL_MS || 3600000),
+          parent.parentId
+        );
+        store.audit("parent", session.familyId, "parent_session_enrolled", null, {
+          platform: String(value.platform || "unknown"),
+          deviceFingerprint: String(value.device_fingerprint || "").slice(0, 256)
+        });
+        sendJson(res, 200, {
+          ok: true,
+          session: {
+            session_token: session.token,
+            family_id: session.familyId,
+            parent_id: parent.parentId,
+            expires_at: session.expiresAt,
+            device_compatibility: androidCompatibility(parent.metadata || {})
+          }
+        });
+        return;
+      }
+
+      if (req.method === "POST" && pathname === "/api/devices/register") {
+        const deviceId = normalizeDeviceId(value.device_id || value.deviceId);
+        const metadata = value.metadata && typeof value.metadata === "object" ? value.metadata : {};
+        const registration = store.registerChildDevice({
+          deviceId,
+          publicKey: String(value.public_key || value.publicKey || ""),
+          authMode: value.auth_mode,
+          deviceName: value.device_name || value.deviceName,
+          childName: value.child_name || value.childName,
+          metadata: {
+            wifi_ip: String(metadata.wifi_ip || metadata.requested_wifi_ip || "").slice(0, 64),
+            phone_number: String(metadata.phone_number || "").slice(0, 64),
+            model: String(metadata.model || "").slice(0, 128),
+            manufacturer: String(metadata.manufacturer || "").slice(0, 128),
+            device: String(metadata.device || "").slice(0, 128),
+            product: String(metadata.product || "").slice(0, 128),
+            android_api_level: Number(metadata.android_api_level || 0) || 0,
+            os_release: String(metadata.os_release || "").slice(0, 64),
+            security_patch: String(metadata.security_patch || "").slice(0, 64),
+            app_version_code: Number(metadata.app_version_code || 0) || 0,
+            app_version_name: String(metadata.app_version_name || "").slice(0, 128)
+          }
+        });
+        store.audit("child", deviceId, "child_device_registered", req.headers["x-request-id"] || null, { registrationStatus: registration.registrationStatus });
+        sendJson(res, 201, { ok: true, device_id: deviceId, registration_status: registration.registrationStatus, relationship_status: "unpaired", policy_ready: false });
+        return;
+      }
+
+      const adminDevice = pathname.match(/^\/api\/admin\/devices\/([^/]+)\/secret$/);
+      if (req.method === "POST" && adminDevice) {
+        auth.requireAdmin(req);
+        const deviceId = normalizeDeviceId(adminDevice[1]);
+        const hasSecret = typeof value.secret === "string" && value.secret.length >= 32 && value.secret.length <= 4096;
+        const hasPublicKey = typeof value.publicKey === "string" && value.publicKey.length >= 32 && value.publicKey.length <= 8192;
+        if (!hasSecret && !hasPublicKey) {
+          throw new StoreError("invalid_device_credential", 400);
+        }
+        const patch = {
+          platform: value.platform === "android" ? "android" : "windows",
+          deviceName: String(value.deviceName || deviceId).slice(0, 256),
+          childName: String(value.childName || "자녀").slice(0, 256)
+        };
+        if (hasSecret) patch.hmacSecret = value.secret;
+        if (hasPublicKey) patch.publicKey = value.publicKey;
+        store.upsertDevice(deviceId, patch);
+        sendJson(res, 200, { ok: true, deviceId });
+        return;
+      }
+
+      const registrationStatus = pathname.match(/^\/api\/devices\/([^/]+)\/registration-status$/);
+      if (req.method === "GET" && registrationStatus) {
+        const deviceId = normalizeDeviceId(registrationStatus[1]);
+        auth.requireDevice(req, deviceId, requestPath, body.raw);
+        const status = store.getRegistrationStatus(deviceId);
+        sendJson(res, status.device ? 200 : 404, status.device ? {
+          ok: true,
+          device_id: deviceId,
+          registration_status: status.registrationStatus,
+          relationship_status: status.relationshipStatus,
+          policy_ready: status.policyReady,
+          policy_assignment: status.policyAssignment ? { assignment_id: status.policyAssignment.assignmentId, version: status.policyAssignment.version, status: status.policyAssignment.status, rejection_reason: status.policyAssignment.rejectionReason } : null,
+          policy_receipt: status.policyReceipt ? { version: status.policyReceipt.version, status: status.policyReceipt.accepted ? "applied" : "pending_or_rejected", local_state: status.policyReceipt.localState, signature_status: status.policyReceipt.signatureStatus } : null,
+          device_compatibility: status.device ? {
+            ...androidCompatibility(status.device.metadata || {}),
+            os_release: String((status.device.metadata || {}).os_release || ""),
+            security_patch: String((status.device.metadata || {}).security_patch || ""),
+            manufacturer: String((status.device.metadata || {}).manufacturer || ""),
+            model: String((status.device.metadata || {}).model || ""),
+            device: String((status.device.metadata || {}).device || ""),
+            product: String((status.device.metadata || {}).product || "")
+          } : null,
+          consent_requests: status.consentRequests.map((item) => ({ request_id: item.requestId, mapping_id: item.mappingId, status: item.status, created_at: item.createdAt, expires_at: item.expiresAt })),
+          mappings: status.mappings.map((item) => ({ mapping_id: item.mappingId, family_id: item.familyId, status: item.status, parent_consent: item.parentConsent, child_consent: item.childConsent }))
+        } : { ok: false, error: "device_not_registered" });
+        return;
+      }
+
+      const childConsent = pathname.match(/^\/api\/devices\/([^/]+)\/consent-requests\/([^/]+)\/decision$/);
+      if (req.method === "POST" && childConsent) {
+        const deviceId = normalizeDeviceId(childConsent[1]);
+        auth.requireDevice(req, deviceId, requestPath, body.raw);
+        const child = Object.values(store.state.childProfiles).find((item) => item.deviceId === deviceId);
+        if (!child) throw new StoreError("child_profile_not_found", 404);
+        const requestId = decodeURIComponent(childConsent[2]);
+        const consentRequest = store.state.consentRequests[requestId];
+        if (!consentRequest || consentRequest.recipientType !== "child" || consentRequest.recipientId !== child.childId) throw new StoreError("consent_request_not_found", 404);
+        const mapping = store.setRelationshipConsent({ mappingId: consentRequest.mappingId, recipientType: "child", recipientId: child.childId, consent: value.consent === true || value.decision === "accept" || value.decision === "approve" });
+        await fcm.sendToDeviceIds([mapping.parentId], { type: "cpsm_relationship_consent", mapping_id: mapping.mappingId, relationship_status: mapping.status, child_consent: String(mapping.childConsent) }, { title: "CPSM 자녀 동의 상태", body: mapping.status === "confirmed" ? "부모-자녀 관계가 확정되었습니다." : "자녀 동의가 저장되었습니다." });
+        sendJson(res, 200, { ok: true, mapping_id: mapping.mappingId, status: mapping.status, parent_consent: mapping.parentConsent, child_consent: mapping.childConsent, policy_ready: mapping.status === "confirmed" });
+        return;
+      }
+
+      const notificationKey = pathname.match(/^\/api\/devices\/([^/]+)\/notification-key$/);
+      if (req.method === "POST" && notificationKey) {
+        const deviceId = normalizeDeviceId(notificationKey[1]);
+        auth.requireDevice(req, deviceId, requestPath, body.raw);
+        const result = store.addNotificationKey({ deviceId, provider: String(value.provider || "fcm"), token: String(value.token || value.fcm_token || "") });
+        sendJson(res, 200, { ok: true, ...result });
+        return;
+      }
+
+      const deviceEvents = pathname.match(/^\/api\/devices\/([^/]+)\/events$/);
       if (req.method === "POST" && deviceEvents) {
-        const deviceId = decodeURIComponent(deviceEvents[1]);
-        const body = await readBody(req);
-        const stored = store.addEvents(deviceId, body.events || []);
+        const deviceId = normalizeDeviceId(deviceEvents[1]);
+        auth.requireDevice(req, deviceId, requestPath, body.raw);
+        const stored = store.addEvents(deviceId, value.events || []);
         for (const event of stored) {
           const action = event.payload && event.payload.action;
           if (action === "require_approval" && !store.pendingRequestForPid(deviceId, event.payload.pid)) {
             const request = store.createApprovalRequest(deviceId, event);
             await notifyParentForEvent(fcm, event, request);
-          } else if (action === "monitor" || action === "block") {
+          } else if (["monitor", "block"].includes(action)) {
             await notifyParentForEvent(fcm, event, null);
           }
         }
-        sendJson(res, 200, { ok: true, received: stored.length });
+        sendJson(res, 200, {
+          ok: true,
+          received: stored.length,
+          acknowledgedEventIds: stored.map((event) => event.eventId),
+          acknowledgedSequences: stored.map((event) => event.sequence).filter((sequence) => sequence != null)
+        });
         return;
       }
 
-      const heartbeat = url.pathname.match(/^\/api\/devices\/([^/]+)\/heartbeat$/);
+      const deviceErrors = pathname.match(/^\/api\/devices\/([^/]+)\/errors$/);
+      if (req.method === "POST" && deviceErrors) {
+        const deviceId = normalizeDeviceId(deviceErrors[1]);
+        auth.requireDevice(req, deviceId, requestPath, body.raw);
+        const result = store.recordDeviceErrors({
+          deviceId,
+          payload: value,
+          requestId: req.headers["x-request-id"] || value.client_request_id || null
+        });
+        sendJson(res, 202, { ok: true, ...result, next_retry_after_ms: 0 });
+        return;
+      }
+
+      const heartbeat = pathname.match(/^\/api\/devices\/([^/]+)\/heartbeat$/);
       if (req.method === "POST" && heartbeat) {
-        const deviceId = decodeURIComponent(heartbeat[1]);
-        const body = await readBody(req);
+        const deviceId = normalizeDeviceId(heartbeat[1]);
+        auth.requireDevice(req, deviceId, requestPath, body.raw);
         store.upsertDevice(deviceId, {
-          deviceName: body.hostname || body.deviceName || deviceId,
-          childName: body.childName || "자녀",
-          platform: body.platform || body.policy && body.policy.platform || "windows",
-          status: body.status || "running"
+          deviceName: String(value.hostname || value.deviceName || deviceId).slice(0, 256),
+          childName: String(value.childName || "자녀").slice(0, 256),
+          platform: value.platform === "android" ? "android" : "windows",
+          status: String(value.status || "running").slice(0, 64),
+          currentApp: String(value.currentApp || value.current_app || "").slice(0, 256),
+          health: value.health && typeof value.health === "object" ? value.health : {}
         });
         sendJson(res, 200, { ok: true });
         return;
       }
 
-      const sync = url.pathname.match(/^\/api\/devices\/([^/]+)\/sync$/);
+      const sync = pathname.match(/^\/api\/devices\/([^/]+)\/sync$/);
       if (req.method === "POST" && sync) {
-        const deviceId = decodeURIComponent(sync[1]);
-        const body = await readBody(req);
+        const deviceId = normalizeDeviceId(sync[1]);
+        auth.requireDevice(req, deviceId, requestPath, body.raw);
+        const status = value.status && typeof value.status === "object" ? value.status : {};
         const device = store.upsertDevice(deviceId, {
-          deviceName: body.deviceName || body.hostname || deviceId,
-          childName: body.childName || "자녀",
-          platform: body.platform || "windows",
-          status: body.status && body.status.status ? body.status.status : "running",
-          currentApp: body.status && body.status.current_app ? body.status.current_app : "",
-          localPolicyVersion: Number(body.local_policy_version || 0),
-          lastEventSeq: Number(body.last_event_seq || 0)
+          deviceName: String(value.deviceName || value.hostname || deviceId).slice(0, 256),
+          childName: String(value.childName || "자녀").slice(0, 256),
+          platform: value.platform === "android" ? "android" : "windows",
+          status: String(status.status || "running").slice(0, 64),
+          currentApp: String(status.current_app || status.currentApp || "").slice(0, 256),
+          localPolicyVersion: Number(value.local_policy_version || 0),
+          lastEventSeq: Number(value.last_event_seq || 0),
+          health: status.health && typeof status.health === "object" ? status.health : {}
         });
         const commands = store.pollCommands(deviceId);
+        const registration = store.getRegistrationStatus(deviceId);
+        const policyReceipt = store.recordPolicySyncReceipt(deviceId, status.policy && typeof status.policy === "object" ? status.policy : {});
+        const androidPolicyBlocked = device.platform === "android" && !registration.policyReady;
+        const signedPolicy = androidPolicyBlocked ? null : store.getSignedPolicy(deviceId);
         sendJson(res, 200, {
           ok: true,
           server_time: new Date().toISOString(),
           device,
-          policy: {
-            changed: Number(body.local_policy_version || 0) < Number(store.state.policy.version || 0),
-            version: store.state.policy.version,
-            hash: store.state.policy.hash,
-            download_url: `/api/devices/${encodeURIComponent(deviceId)}/policy?version=${store.state.policy.version}`
+          registration: {
+            status: registration.registrationStatus,
+            relationship_status: registration.relationshipStatus,
+            policy_ready: registration.policyReady
+          },
+          policy_receipt: { status: policyReceipt.accepted ? "applied" : "pending_or_rejected", version: policyReceipt.version, local_state: policyReceipt.localState, signature_status: policyReceipt.signatureStatus },
+          policy: androidPolicyBlocked ? {
+            available: false,
+            changed: false,
+            version: 0,
+            hash: "",
+            canonical_hash: "",
+            reason: registration.relationshipStatus === "unpaired" ? "parent_mapping_required" : "mutual_consent_required"
+          } : {
+            available: true,
+            changed: Number(value.local_policy_version || 0) < Number(signedPolicy.version || 0),
+            version: signedPolicy.version,
+            hash: signedPolicy.canonicalHash,
+            canonical_hash: signedPolicy.canonicalHash,
+            download_url: `/api/devices/${encodeURIComponent(deviceId)}/policy?version=${signedPolicy.version}`
           },
           commands,
-          next_sync_after_ms: jitteredSyncMs()
+          next_sync_after_ms: 30000 + Math.floor(Math.random() * 15000)
         });
         return;
       }
 
-      const policy = url.pathname.match(/^\/api\/devices\/([^/]+)\/policy$/);
+      const policy = pathname.match(/^\/api\/devices\/([^/]+)\/policy$/);
       if (req.method === "GET" && policy) {
-        const deviceId = decodeURIComponent(policy[1]);
-        sendJson(res, 200, makePolicyFromBlockedApps(store, deviceId));
+        const deviceId = normalizeDeviceId(policy[1]);
+        auth.requireDevice(req, deviceId, requestPath, body.raw);
+        const registration = store.getRegistrationStatus(deviceId);
+        const device = store.state.devices[deviceId];
+        if (device && device.platform === "android" && !registration.policyReady) {
+          sendJson(res, 409, { ok: false, error: "policy_not_ready", reason: registration.relationshipStatus === "unpaired" ? "parent_mapping_required" : "mutual_consent_required" });
+          return;
+        }
+        sendJson(res, 200, { ...store.getSignedPolicy(deviceId) });
         return;
       }
 
-      const pollCommands = url.pathname.match(/^\/api\/devices\/([^/]+)\/commands\/poll$/);
+      const updateManifest = pathname.match(/^\/api\/devices\/([^/]+)\/updates\/manifest$/);
+      if (req.method === "GET" && updateManifest) {
+        const deviceId = normalizeDeviceId(updateManifest[1]);
+        auth.requireDevice(req, deviceId, requestPath, body.raw);
+        const product = String(requestUrl.searchParams.get("product") || "");
+        const device = store.state.devices[deviceId];
+        const expectedProduct = device && device.platform === "android" ? "cpsm-m" : "cpsm-c";
+        if (product !== expectedProduct) throw new ArtifactError("artifact_product_not_for_device", 403);
+        artifacts.sendManifest(
+          res,
+          expectedProduct === "cpsm-m" ? "android" : "windows",
+          product,
+          `/api/devices/${encodeURIComponent(deviceId)}/updates/download?product=${encodeURIComponent(product)}`
+        );
+        return;
+      }
+
+      const updateDownload = pathname.match(/^\/api\/devices\/([^/]+)\/updates\/download$/);
+      if (req.method === "GET" && updateDownload) {
+        const deviceId = normalizeDeviceId(updateDownload[1]);
+        auth.requireDevice(req, deviceId, requestPath, body.raw);
+        const product = String(requestUrl.searchParams.get("product") || "");
+        const device = store.state.devices[deviceId];
+        const expectedProduct = device && device.platform === "android" ? "cpsm-m" : "cpsm-c";
+        if (product !== expectedProduct) throw new ArtifactError("artifact_product_not_for_device", 403);
+        artifacts.sendArtifact(res, expectedProduct === "cpsm-m" ? "android" : "windows", product);
+        return;
+      }
+
+      const pollCommands = pathname.match(/^\/api\/devices\/([^/]+)\/commands\/poll$/);
       if (req.method === "GET" && pollCommands) {
-        const deviceId = decodeURIComponent(pollCommands[1]);
+        const deviceId = normalizeDeviceId(pollCommands[1]);
+        auth.requireDevice(req, deviceId, requestPath, body.raw);
         sendJson(res, 200, { commands: store.pollCommands(deviceId) });
         return;
       }
 
-      const commandResult = url.pathname.match(/^\/api\/devices\/([^/]+)\/commands\/([^/]+)\/result$/);
+      const commandResult = pathname.match(/^\/api\/devices\/([^/]+)\/commands\/([^/]+)\/result$/);
       if (req.method === "POST" && commandResult) {
-        const deviceId = decodeURIComponent(commandResult[1]);
+        const deviceId = normalizeDeviceId(commandResult[1]);
+        auth.requireDevice(req, deviceId, requestPath, body.raw);
         const commandId = decodeURIComponent(commandResult[2]);
-        const body = await readBody(req);
-        sendJson(res, 200, { ok: true, command: store.completeCommand(deviceId, commandId, body) });
+        const command = store.completeCommand(deviceId, commandId, value);
+        if (!command) {
+          sendJson(res, 404, { ok: false, error: "command_not_found" });
+          return;
+        }
+        sendJson(res, 200, { ok: true, command });
         return;
       }
 
-      if (req.method === "GET" && url.pathname === "/api/parent/approval-requests") {
+      const devicePairingClaim = pathname.match(/^\/api\/devices\/([^/]+)\/pairing-sessions\/([^/]+)\/claim$/);
+      if (req.method === "POST" && devicePairingClaim) {
+        const deviceId = normalizeDeviceId(devicePairingClaim[1]);
+        auth.requireDevice(req, deviceId, requestPath, body.raw);
+        const claimed = store.claimPairingSession({
+          sessionId: decodeURIComponent(devicePairingClaim[2]),
+          pairingCode: value.pairing_code || value.pairingCode,
+          claimantType: "child",
+          childDeviceId: deviceId
+        });
+        const preview = store.pairingPreview(claimed.mapping.mappingId);
+        sendJson(res, 201, { ok: true, pairing_session_id: claimed.sessionId, mapping: claimed.mapping, preview });
+        return;
+      }
+      const devicePairingConfirm = pathname.match(/^\/api\/devices\/([^/]+)\/pairing-sessions\/([^/]+)\/confirm$/);
+      if (req.method === "POST" && devicePairingConfirm) {
+        const deviceId = normalizeDeviceId(devicePairingConfirm[1]);
+        auth.requireDevice(req, deviceId, requestPath, body.raw);
+        const confirmed = store.confirmPairingSession({
+          sessionId: decodeURIComponent(devicePairingConfirm[2]),
+          claimantType: "child",
+          childDeviceId: deviceId,
+          consent: value.consent === true
+        });
+        store.audit("device", deviceId, value.consent === true ? "pairing_confirmed" : "pairing_declined", req.headers["x-request-id"] || null, { sessionId: confirmed.sessionId, mappingId: confirmed.mapping.mappingId });
+        sendJson(res, 200, { ok: true, pairing_session_id: confirmed.sessionId, mapping: confirmed.mapping, status: confirmed.status, policy_ready: confirmed.status === "confirmed" });
+        return;
+      }
+      const devicePairingSession = pathname.match(/^\/api\/devices\/([^/]+)\/pairing-sessions$/);
+      if (req.method === "POST" && devicePairingSession) {
+        const deviceId = normalizeDeviceId(devicePairingSession[1]);
+        auth.requireDevice(req, deviceId, requestPath, body.raw);
+        const session = store.createPairingSession({ issuerType: "child", issuerId: deviceId, childDeviceId: deviceId });
+        store.audit("device", deviceId, "pairing_session_created", req.headers["x-request-id"] || null, { sessionId: session.sessionId, expiresAt: session.expiresAt });
+        sendJson(res, 201, { ok: true, pairing_session_id: session.sessionId, pairing_code: session.pairingCode, expires_at: session.expiresAt });
+        return;
+      }
+
+      // Normal Parent users must never handle the server bootstrap secret. The
+      // Android app generates a Keystore key on first launch and self-enrolls
+      // into an isolated family. Child/Parent QR pairing remains the consent
+      // boundary for accessing a child device.
+      if (req.method === "POST" && pathname === "/api/parent/auth/auto-enroll") {
+        const publicKey = String(value.device_pubkey || value.public_key || "");
+        const fingerprint = String(value.device_fingerprint || "").trim().toLowerCase();
+        if (publicKey.length < 32 || publicKey.length > 8192) throw new AuthError("invalid_parent_device_public_key", 400);
+        if (!/^[a-f0-9]{64}$/.test(fingerprint)) throw new AuthError("invalid_parent_device_fingerprint", 400);
+        let publicKeyBytes;
+        try {
+          publicKeyBytes = Buffer.from(publicKey, "base64");
+          crypto.createPublicKey({ key: publicKeyBytes, format: "der", type: "spki" });
+        } catch (_) {
+          throw new AuthError("invalid_parent_device_public_key", 400);
+        }
+        const derivedFingerprint = crypto.createHash("sha256").update(publicKeyBytes).digest("hex");
+        if (derivedFingerprint !== fingerprint) throw new AuthError("parent_device_fingerprint_mismatch", 400);
+        const existingParent = Object.values(store.state.parentProfiles || {}).find((item) => item.deviceFingerprint === fingerprint);
+        const familyId = existingParent && existingParent.familyId
+          ? existingParent.familyId
+          : `family-${crypto.createHash("sha256").update(fingerprint, "utf8").digest("hex").slice(0, 24)}`;
+        const parent = store.ensureParentProfile({
+          familyId,
+          deviceFingerprint: fingerprint,
+          publicKey,
+          displayName: value.display_name || "부모",
+          metadata: value.metadata || {}
+        });
+        const session = store.issueParentSession(parent.familyId, 3600000, parent.parentId);
+        store.audit("parent", parent.parentId, "parent_auto_enrolled", req.headers["x-request-id"] || null, {
+          familyId: parent.familyId,
+          enrollment: "qr_pairing_ready"
+        });
+        sendJson(res, 201, {
+          ok: true,
+          enrollment: "automatic",
+          parent: { parent_id: parent.parentId, family_id: parent.familyId, display_name: parent.displayName },
+          session: {
+            session_token: session.token,
+            expires_at: session.expiresAt,
+            family_id: session.familyId,
+            parent_id: session.parentId,
+            device_compatibility: androidCompatibility(value.metadata || {})
+          }
+        });
+        return;
+      }
+
+      if (pathname.startsWith("/api/parent/")) auth.requireParent(req);
+
+      if (req.method === "GET" && pathname === "/api/parent/updates/manifest") {
+        const product = String(requestUrl.searchParams.get("product") || "cpsm-p");
+        if (product !== "cpsm-p") throw new ArtifactError("artifact_product_not_for_parent", 403);
+        artifacts.sendManifest(res, "android", product, "/api/parent/updates/download?product=cpsm-p");
+        return;
+      }
+
+      if (req.method === "GET" && pathname === "/api/parent/updates/download") {
+        const product = String(requestUrl.searchParams.get("product") || "cpsm-p");
+        if (product !== "cpsm-p") throw new ArtifactError("artifact_product_not_for_parent", 403);
+        artifacts.sendArtifact(res, "android", product);
+        return;
+      }
+
+      if (req.method === "POST" && pathname === "/api/parent/devices/fcm-token") {
+        const token = value.fcm_token || value.token;
+        store.registerParentToken(token);
+        const sessionForToken = store.getParentSession(auth.bearerToken(req));
+        if (sessionForToken && sessionForToken.parent_id) {
+          store.addNotificationKey({ deviceId: sessionForToken.parent_id, provider: "fcm", token });
+        }
+        sendJson(res, 200, { ok: true, registered: true });
+        return;
+      }
+
+      const parentSession = store.getParentSession(auth.bearerToken(req));
+      const requireParentProfile = () => {
+        if (!parentSession || !parentSession.parent_id) throw new StoreError("parent_session_profile_required", 403);
+        return parentSession;
+      };
+      if (req.method === "POST" && pathname === "/api/parent/pairing-sessions") {
+        const session = requireParentProfile();
+        const pairing = store.createPairingSession({ issuerType: "parent", issuerId: session.parent_id, familyId: session.family_id });
+        store.audit("parent", session.parent_id, "pairing_session_created", req.headers["x-request-id"] || null, { sessionId: pairing.sessionId, expiresAt: pairing.expiresAt });
+        sendJson(res, 201, { ok: true, pairing_session_id: pairing.sessionId, pairing_code: pairing.pairingCode, expires_at: pairing.expiresAt, role: "parent" });
+        return;
+      }
+      if (req.method === "GET" && pathname === "/api/parent/families") {
+        const session = requireParentProfile();
+        sendJson(res, 200, { families: Object.values(store.state.families).filter((family) => family.familyId === session.family_id) });
+        return;
+      }
+      if (req.method === "GET" && pathname === "/api/parent/children/available") {
+        requireParentProfile();
+        sendJson(res, 200, { children: store.listAvailableChildren(parentSession.family_id).map((item) => ({ child_id: item.child.childId, device_id: item.device.deviceId, display_name: item.child.displayName, device_name: item.device.deviceName, registration_status: item.device.registrationStatus, relationship_status: item.relationshipStatus, compatibility: androidCompatibility(item.device.metadata || {}), metadata: item.device.metadata || {} })) });
+        return;
+      }
+      const parentPairingStatus = pathname.match(/^\/api\/parent\/pairing-sessions\/([^/]+)$/);
+      if (req.method === "GET" && parentPairingStatus) {
+        const session = requireParentProfile();
+        const pairingSessionId = decodeURIComponent(parentPairingStatus[1]);
+        const pairing = store.state.pairingSessions[pairingSessionId];
+        if (!pairing || pairing.issuerType !== "parent" || pairing.issuerId !== session.parent_id) {
+          throw new StoreError("pairing_session_not_found", 404);
+        }
+        const expired = Number(pairing.expiresAt) <= Date.now()
+          && ["pending", "claimed"].includes(pairing.status);
+        const mapping = pairing.mappingId ? store.state.parentChildMappings[pairing.mappingId] || null : null;
+        sendJson(res, 200, {
+          ok: true,
+          pairing_session_id: pairingSessionId,
+          status: expired ? "expired" : pairing.status,
+          expires_at: new Date(Number(pairing.expiresAt)).toISOString(),
+          mapping
+        });
+        return;
+      }
+      const parentPairingClaim = pathname.match(/^\/api\/parent\/pairing-sessions\/([^/]+)\/claim$/);
+      if (req.method === "POST" && parentPairingClaim) {
+        const session = requireParentProfile();
+        const pairingSessionId = decodeURIComponent(parentPairingClaim[1]);
+        const claimed = store.claimPairingSession({
+          sessionId: pairingSessionId,
+          pairingCode: value.pairing_code || value.pairingCode,
+          claimantType: "parent",
+          familyId: session.family_id,
+          parentId: session.parent_id
+        });
+        const preview = store.pairingPreview(claimed.mapping.mappingId);
+        store.audit("parent", session.parent_id, "parent_pairing_session_claimed", req.headers["x-request-id"] || null, { pairingSessionId, mappingId: claimed.mapping.mappingId });
+        sendJson(res, 201, { ok: true, pairing_session_id: pairingSessionId, mapping: claimed.mapping, preview });
+        return;
+      }
+      const parentPairingConfirm = pathname.match(/^\/api\/parent\/pairing-sessions\/([^/]+)\/confirm$/);
+      if (req.method === "POST" && parentPairingConfirm) {
+        const session = requireParentProfile();
+        const pairingSessionId = decodeURIComponent(parentPairingConfirm[1]);
+        const confirmed = store.confirmPairingSession({
+          sessionId: pairingSessionId,
+          claimantType: "parent",
+          familyId: session.family_id,
+          parentId: session.parent_id,
+          consent: value.consent === true
+        });
+        store.audit("parent", session.parent_id, value.consent === true ? "pairing_confirmed" : "pairing_declined", req.headers["x-request-id"] || null, { sessionId: confirmed.sessionId, mappingId: confirmed.mapping.mappingId });
+        sendJson(res, 200, { ok: true, pairing_session_id: confirmed.sessionId, mapping: confirmed.mapping, status: confirmed.status, policy_ready: confirmed.status === "confirmed" });
+        return;
+      }
+      if (req.method === "POST" && pathname === "/api/parent/mappings") {
+        const session = requireParentProfile();
+        const childDeviceId = normalizeDeviceId(value.child_device_id || value.device_id);
+        const mapping = store.createParentChildMapping({ familyId: session.family_id, parentId: session.parent_id, childDeviceId });
+        const childProfile = store.state.childProfiles[mapping.childId];
+        await fcm.sendToDeviceIds([session.parent_id, childProfile ? childProfile.deviceId : ""], {
+          type: "cpsm_relationship_consent",
+          mapping_id: mapping.mappingId,
+          relationship_status: mapping.status
+        }, { title: "CPSM 부모-자녀 연결 동의", body: "관계 동의 요청을 확인하세요." });
+        store.audit("parent", session.parent_id, "parent_child_mapping_requested", req.headers["x-request-id"] || null, { mappingId: mapping.mappingId, childDeviceId });
+        sendJson(res, 201, { ok: true, mapping });
+        return;
+      }
+      if (req.method === "GET" && pathname === "/api/parent/mappings") {
+        const session = requireParentProfile();
+        const mappings = Object.values(store.state.parentChildMappings).filter((mapping) => mapping.familyId === session.family_id && mapping.parentId === session.parent_id);
+        sendJson(res, 200, { mappings });
+        return;
+      }
+      const parentConsent = pathname.match(/^\/api\/parent\/mappings\/([^/]+)\/consent$/);
+      if (req.method === "POST" && parentConsent) {
+        const session = requireParentProfile();
+        const mappingId = decodeURIComponent(parentConsent[1]);
+        const mapping = store.state.parentChildMappings[mappingId];
+        if (!mapping || mapping.familyId !== session.family_id || mapping.parentId !== session.parent_id) throw new StoreError("mapping_not_found", 404);
+        const updated = store.setRelationshipConsent({ mappingId, recipientType: "parent", recipientId: session.parent_id, consent: value.consent === true || value.decision === "accept" || value.decision === "approve" });
+        sendJson(res, 200, { ok: true, mapping: updated, policy_ready: updated.status === "confirmed" });
+        return;
+      }
+      if (req.method === "GET" && pathname === "/api/parent/consent-requests") {
+        const session = requireParentProfile();
+        const requests = Object.values(store.state.consentRequests).filter((request) => request.recipientType === "parent" && request.recipientId === session.parent_id);
+        sendJson(res, 200, { requests });
+        return;
+      }
+
+      const parentDevice = pathname.match(/^\/api\/parent\/devices\/([^/]+)\/(health|timeline)$/);
+      if (req.method === "GET" && parentDevice) {
+        const deviceId = normalizeDeviceId(parentDevice[1]);
+        if (parentDevice[2] === "health") {
+          sendJson(res, 200, { device: store.state.devices[deviceId] || null });
+        } else {
+          sendJson(res, 200, { events: store.state.events.filter((event) => event.deviceId === deviceId).slice(-200).reverse() });
+        }
+        return;
+      }
+
+      const approvalRead = pathname.match(/^\/api\/parent\/approval-requests\/([^/]+)$/);
+      if (req.method === "GET" && approvalRead) {
+        const request = store.state.approvalRequests.find((item) => item.id === decodeURIComponent(approvalRead[1]));
+        sendJson(res, request ? 200 : 404, request ? request : { ok: false, error: "request_not_found" });
+        return;
+      }
+
+      const approvalDecision = pathname.match(/^\/api\/parent\/approval-requests\/([^/]+)\/decision$/);
+      if (req.method === "POST" && approvalDecision) {
+        const requestId = decodeURIComponent(approvalDecision[1]);
+        const decision = value.decision === "allow" ? "allow" : (value.decision === "terminate" ? "terminate" : "");
+        if (!decision) throw new StoreError("invalid_decision", 400);
+        const request = store.decideApprovalRequest(requestId, decision);
+        if (!request) {
+          sendJson(res, 404, { ok: false, error: "request_not_found" });
+          return;
+        }
+        const command = decision === "allow"
+          ? store.queueCommand(request.deviceId, "app.allow.temporary", { processName: request.appName, minutes: 120, requestId }, { idempotencyKey: String(value.idempotency_key || requestId) })
+          : store.queueCommand(request.deviceId, "app.terminate", { pid: request.pid, processName: request.appName, requestId }, { idempotencyKey: String(value.idempotency_key || requestId) });
+        sendJson(res, 200, { ok: true, request, command });
+        return;
+      }
+      if (req.method === "GET" && pathname === "/api/parent/approval-requests") {
         sendJson(res, 200, { requests: store.state.approvalRequests.slice().reverse() });
         return;
       }
-
-      if (req.method === "GET" && url.pathname === "/api/parent/dashboard") {
+      if (req.method === "GET" && pathname === "/api/parent/dashboard") {
         sendJson(res, 200, store.dashboard());
         return;
       }
-
-      if (req.method === "GET" && url.pathname === "/api/parent/policies/current") {
-        sendJson(res, 200, store.state.policy);
+      if (req.method === "GET" && pathname === "/api/parent/policies/current") {
+        const familyPolicy = parentSession && parentSession.family_id ? store.getFamilyPolicy(parentSession.family_id) : null;
+        const policy = familyPolicy && familyPolicy.policy ? familyPolicy.policy : store.state.policy;
+        sendJson(res, 200, { ...policy, family_id: familyPolicy ? familyPolicy.familyId : null, publicKey: publicKeyPem(store) });
         return;
       }
-
-      if (req.method === "POST" && url.pathname === "/api/parent/policies") {
-        const body = await readBody(req);
-        const rules = Array.isArray(body.rules) ? body.rules : [];
-        store.replacePolicyRules(rules.map((rule) => ({
-          id: rule.id || crypto.randomUUID(),
-          name: rule.name || rule.id || "rule",
-          platform: rule.platform || "windows",
-          match: rule.match || { type: "processName", processName: rule.processName || rule.packageName || "" },
-          action: rule.action || "monitor",
-          excludedUntil: rule.excludedUntil || "",
-          reason: rule.reason || "parent_policy"
-        })));
+      if ((req.method === "POST" && pathname === "/api/parent/policies")
+          || (req.method === "PUT" && pathname === "/api/parent/policies/current")) {
+        const rules = sanitizeRules(value.rules || []);
+        const familyPolicy = parentSession && parentSession.family_id && parentSession.parent_id
+          ? store.replaceFamilyPolicyRules(parentSession.family_id, rules) : null;
+        if (!familyPolicy) store.replacePolicyRules(rules);
+        const policyRefreshVersion = familyPolicy ? familyPolicy.version : store.state.policy.version;
         for (const deviceId of Object.keys(store.state.devices)) {
-          store.queueCommand(deviceId, "policy.refresh", {});
+          store.queueCommand(deviceId, "policy.refresh", {}, { idempotencyKey: `policy-${policyRefreshVersion}-${deviceId}` });
         }
-        sendJson(res, 200, { ok: true, policy: store.state.policy });
+        const policy = familyPolicy && familyPolicy.policy ? familyPolicy.policy : store.state.policy;
+        sendJson(res, 200, { ok: true, policy: { ...policy, family_id: familyPolicy ? familyPolicy.familyId : null, publicKey: publicKeyPem(store) } });
         return;
       }
 
-      const approvalAction = url.pathname.match(/^\/api\/parent\/approval-requests\/([^/]+)\/(allow|terminate)$/);
+      const approvalAction = pathname.match(/^\/api\/parent\/approval-requests\/([^/]+)\/(allow|terminate)$/);
       if (req.method === "POST" && approvalAction) {
         const requestId = decodeURIComponent(approvalAction[1]);
         const action = approvalAction[2];
@@ -262,46 +949,22 @@ async function main() {
           sendJson(res, 404, { ok: false, error: "request_not_found" });
           return;
         }
-
         const command = action === "allow"
-          ? store.queueCommand(request.deviceId, "app.allow.temporary", {
-            processName: request.appName,
-            minutes: 120,
-            requestId
-          })
-          : store.queueCommand(request.deviceId, "app.terminate", {
-            pid: request.pid,
-            processName: request.appName,
-            requestId
-          });
-
+          ? store.queueCommand(request.deviceId, "app.allow.temporary", { processName: request.appName, minutes: 120, requestId }, { idempotencyKey: requestId })
+          : store.queueCommand(request.deviceId, "app.terminate", { pid: request.pid, processName: request.appName, requestId }, { idempotencyKey: requestId });
         sendJson(res, 200, { ok: true, request, command });
         return;
       }
-
-      if (req.method === "GET" && url.pathname === "/api/parent/blocked-apps") {
+      if (req.method === "GET" && pathname === "/api/parent/blocked-apps") {
         sendJson(res, 200, { blockedApps: store.state.policy.rules });
         return;
       }
-
-      if (req.method === "POST" && url.pathname === "/api/parent/blocked-apps") {
-        const body = await readBody(req);
-        const rule = {
-          id: body.id || crypto.randomUUID(),
-          deviceId: body.deviceId || "",
-          name: body.name || body.processName,
-          platform: body.platform || "windows",
-          match: body.match || { type: "processName", processName: body.processName },
-          action: body.action || "block",
-          excludedUntil: body.excludedUntil || "",
-          createdAt: new Date().toISOString()
-        };
-        store.setBlockedApp(rule);
-        const targetDevices = rule.deviceId
-          ? [rule.deviceId]
-          : Object.keys(store.state.devices);
+      if (req.method === "POST" && pathname === "/api/parent/blocked-apps") {
+        const rule = sanitizeRules([{ ...value, id: value.id || crypto.randomUUID() }])[0];
+        store.setBlockedApp({ ...rule, deviceId: String(value.deviceId || "") });
+        const targetDevices = value.deviceId ? [normalizeDeviceId(value.deviceId)] : Object.keys(store.state.devices);
         for (const deviceId of targetDevices) {
-          store.queueCommand(deviceId, "policy.refresh", {});
+          store.queueCommand(deviceId, "policy.refresh", {}, { idempotencyKey: `policy-${store.state.policy.version}-${deviceId}` });
         }
         sendJson(res, 200, { ok: true, rule });
         return;
@@ -309,13 +972,26 @@ async function main() {
 
       sendJson(res, 404, { ok: false, error: "not_found" });
     } catch (error) {
-      log.error("request.failed", { message: error.message });
-      sendJson(res, 500, { ok: false, error: error.message });
+      const status = error instanceof AuthError || error instanceof StoreError || error instanceof ArtifactError
+        ? error.status
+        : 500;
+      const code = error instanceof AuthError || error instanceof StoreError || error instanceof ArtifactError
+        ? error.code
+        : "internal_error";
+      if (status >= 500) log.error("request.failed", { code });
+      sendJson(res, status, { ok: false, error: code });
     }
   });
 
-  server.listen(options.port, "127.0.0.1", () => {
-    log.info("server.started", { port: options.port, dataDir: path.resolve(options.dataDir), fcmEnabled: fcm.enabled() });
+  server.listen(options.port, options.host, () => {
+    log.info("server.started", {
+      host: options.host,
+      port: options.port,
+      dataDir: path.resolve(options.dataDir),
+      storage: store.storageMode(),
+      fcmEnabled: fcm.enabled(),
+      authMode: auth.mode
+    });
   });
 }
 

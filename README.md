@@ -9,14 +9,14 @@
 - 부모앱 `cpsm-p`에서 작성한 정책 규칙 저장 및 버전 관리
 - 자녀 기기의 `/sync` 요청에 정책 변경 여부와 명령 큐 반환
 - `monitor`, `block`, `require_approval` 이벤트 처리
-- 부모 기기로 FCM data message 발송
+- 부모 기기로 FCM data message 발송 시도
 - 부모의 허락/종료 결정을 자녀 기기 명령으로 변환
 
 ## 현재 설계
 
-정책 원본은 서버에 있습니다. 부모앱이 규칙을 작성하면 서버는 정책 버전을 증가시키고, 자녀 기기(`cpsm-c`, `cpsm-m`)는 주기적으로 `/sync`를 호출해 새 버전이 있는지 확인합니다.
+정책 원본은 서버에 있습니다. 부모앱이 규칙을 작성하면 서버는 정책 버전을 증가시키고, 자녀 기기(`cpsm-c`, `cpsm-m`)는 인증된 `/sync`를 호출해 새 버전이 있는지 확인합니다. 서버는 SQLite canonical store에 lifecycle, pairing, policy, command, event, error telemetry를 저장합니다.
 
-현재는 HTTP polling을 사용합니다. 동접 5만 명으로 커질 때도 이 프로토콜은 유지할 수 있고, 내부 구현만 다음처럼 분리하면 됩니다.
+현재는 HTTP polling을 사용합니다. 동접 5만 명으로 커질 때도 이 프로토콜은 유지할 수 있고, 내부 구현만 다음처럼 분리하면 됩니다. FCM은 명령·관계 확정의 authoritative transport가 아니라 wake-up/notification hint입니다.
 
 ```text
 현재 MVP:
@@ -43,6 +43,8 @@ Steam은 예시일 뿐입니다. Epic Games, KakaoTalk, Android package name 등
 
 ## 주요 API
 
+> 전체 엔드포인트(관리자·기기 등록·동의·업데이트 포함 약 45개), 기기 서명 규칙, 파라미터 샘플은 [docs/API.md](docs/API.md) 참고. GitHub 저장소는 `https://github.com/cjakma/cpsm-server`입니다.
+
 ```http
 GET  /api/status
 POST /api/admin/portal-device/token
@@ -61,9 +63,23 @@ GET  /api/parent/policies/current
 POST /api/parent/policies
 GET  /api/parent/blocked-apps
 POST /api/parent/blocked-apps
+POST /api/parent/pairing-sessions
+GET  /api/parent/pairing-sessions/{id}
+POST /api/parent/pairing-sessions/{id}/claim
+POST /api/parent/pairing-sessions/{id}/confirm
 ```
 
-`/api/parent/blocked-apps`는 기존 부모앱 UI 호환을 위해 이름을 유지합니다. 현재 응답 내용은 차단 목록만이 아니라 `monitor`, `block`, `require_approval` 전체 정책 규칙입니다.
+`/api/parent/blocked-apps`는 기존 부모앱 UI 호환을 위해 이름을 유지합니다. 현재 응답 내용은 차단 목록만이 아니라 `monitor`, `block`, `require_approval` 전체 정책 규칙입니다. QR pairing의 관계 확정은 claim preview와 스캔한 기기의 단일 confirm 뒤에만 허용됩니다.
+
+## QR pairing 상태 통지
+
+```text
+claim → 부모·자녀 이름 preview → 스캔한 기기 단일 confirm
+→ mapping/session=confirmed → 선택적 FCM wake-up
+→ Parent가 인증된 pairing-session status 재조회
+```
+
+FCM payload는 `type`, `pairing_session_id`, `status` 정도의 최소 정보만 사용하며, FCM 수신 자체로 QR을 닫거나 관계를 확정하지 않습니다. 현재 운영 FCM은 disabled이고 Parent version 19는 임시 1.5초 status polling을 사용합니다. 최종 설계는 FCM wake-up 후 인증 GET 1회와 30~45초 Long Polling fallback이며, 해당 endpoint와 pairing-specific handler는 아직 구현되지 않았습니다.
 
 ## Device Sync
 
@@ -126,11 +142,11 @@ Firebase Admin SDK service account 파일은 아래 경로를 기본으로 사�
 cpsm-server\secrets\firebase-adminsdk.json
 ```
 
-현재 적용된 Firebase project:
+운영 credential는 저장소에 포함하지 않습니다. 문서와 GitHub에는 다음과 같은 비밀값 placeholder만 기록합니다.
 
 ```text
-project_id: childrens-pc-sec-monit
-client_email: firebase-adminsdk-fbsvc@childrens-pc-sec-monit.iam.gserviceaccount.com
+project_id: [REDACTED]
+client_email: [REDACTED]
 ```
 
 다른 경로를 쓰려면 환경 변수를 설정합니다.
@@ -140,7 +156,7 @@ $env:GOOGLE_APPLICATION_CREDENTIALS='C:\path\firebase-service-account.json'
 $env:FIREBASE_PROJECT_ID='your-firebase-project-id'
 ```
 
-FCM service account가 없거나 부모 FCM token이 등록되지 않으면 실제 발송 대신 `data\notifications.ndjson`에 fallback payload를 기록합니다.
+현재 `CPSM_FCM_ENABLED=0`이며, service account가 없거나 부모 FCM token이 등록되지 않으면 실제 발송 대신 `data\notifications.ndjson`에 fallback payload를 기록합니다. 서비스 계정 JSON과 private key는 `secrets/` 또는 secret store에만 두고 commit하지 않습니다.
 
 ## 이벤트 흐름
 
@@ -160,3 +176,5 @@ FCM service account가 없거나 부모 FCM token이 등록되지 않으면 실�
 npm run check
 npm run smoke
 ```
+
+서버/API smoke는 SQLite lifecycle, 양방향 QR claim, preview, 단일 confirm, role 검증, policy gate, error telemetry, OTA metadata를 확인합니다. 운영 status와 public artifact readback은 별도의 배포 검증입니다.
