@@ -2,6 +2,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { screenTimeForPlatform } = require("./screenTime");
+const { classifyGeofence } = require("./location");
 
 let DatabaseSync;
 try {
@@ -114,6 +115,12 @@ function defaultState() {
     parentProfiles: {},
     childProfiles: {},
     familyMembers: [],
+    geofences: {},
+    locationConsents: {},
+    locationRequests: {},
+    locationSamples: {},
+    geofenceStates: {},
+    locationTransitions: {},
     parentChildMappings: {},
     consentRequests: {},
     notificationKeys: {},
@@ -155,6 +162,12 @@ function normalizeState(input) {
     parentProfiles: state.parentProfiles && typeof state.parentProfiles === "object" && !Array.isArray(state.parentProfiles) ? state.parentProfiles : {},
     childProfiles: state.childProfiles && typeof state.childProfiles === "object" && !Array.isArray(state.childProfiles) ? state.childProfiles : {},
     familyMembers: Array.isArray(state.familyMembers) ? state.familyMembers : [],
+    geofences: state.geofences && typeof state.geofences === "object" && !Array.isArray(state.geofences) ? state.geofences : {},
+    locationConsents: state.locationConsents && typeof state.locationConsents === "object" && !Array.isArray(state.locationConsents) ? state.locationConsents : {},
+    locationRequests: state.locationRequests && typeof state.locationRequests === "object" && !Array.isArray(state.locationRequests) ? state.locationRequests : {},
+    locationSamples: state.locationSamples && typeof state.locationSamples === "object" && !Array.isArray(state.locationSamples) ? state.locationSamples : {},
+    geofenceStates: state.geofenceStates && typeof state.geofenceStates === "object" && !Array.isArray(state.geofenceStates) ? state.geofenceStates : {},
+    locationTransitions: state.locationTransitions && typeof state.locationTransitions === "object" && !Array.isArray(state.locationTransitions) ? state.locationTransitions : {},
     parentChildMappings: state.parentChildMappings && typeof state.parentChildMappings === "object" && !Array.isArray(state.parentChildMappings) ? state.parentChildMappings : {},
     consentRequests: state.consentRequests && typeof state.consentRequests === "object" && !Array.isArray(state.consentRequests) ? state.consentRequests : {},
     notificationKeys: state.notificationKeys && typeof state.notificationKeys === "object" && !Array.isArray(state.notificationKeys) ? state.notificationKeys : {},
@@ -229,6 +242,10 @@ class Store {
     this._jsonNonces = [];
     this.policyTtlMs = Number(options.policyTtlMs || process.env.CPSM_POLICY_TTL_MS || 86400000);
     this.maxCommandRetries = Number(options.maxCommandRetries || process.env.CPSM_COMMAND_MAX_RETRIES || 3);
+    const retentionDays = Number(options.locationRetentionDays ?? process.env.CPSM_LOCATION_RETENTION_DAYS ?? 30);
+    this.locationRetentionDays = Number.isInteger(retentionDays) && retentionDays >= 1 && retentionDays <= 90 ? retentionDays : 30;
+    const minBatteryPercent = Number(options.locationMinBatteryPercent ?? process.env.CPSM_LOCATION_MIN_BATTERY_PERCENT ?? 30);
+    this.locationMinBatteryPercent = Number.isInteger(minBatteryPercent) && minBatteryPercent >= 0 && minBatteryPercent <= 100 ? minBatteryPercent : 30;
     this.sqlite = Boolean(DatabaseSync);
     this.db = null;
 
@@ -249,6 +266,7 @@ class Store {
       this.initializeJson(null);
     }
     this.ensurePolicy();
+    this.purgeLocationData();
     this.save();
   }
 
@@ -402,6 +420,83 @@ class Store {
         created_at TEXT NOT NULL,
         PRIMARY KEY (family_id, member_type, member_id)
       );
+      CREATE TABLE IF NOT EXISTS geofences (
+        geofence_id TEXT PRIMARY KEY,
+        family_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        latitude REAL NOT NULL,
+        longitude REAL NOT NULL,
+        radius_m INTEGER NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_by_parent_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS geofences_family_updated ON geofences(family_id, updated_at);
+      CREATE TABLE IF NOT EXISTS location_consents (
+        device_id TEXT PRIMARY KEY,
+        family_id TEXT NOT NULL,
+        parent_consented INTEGER NOT NULL DEFAULT 0,
+        child_consented INTEGER NOT NULL DEFAULT 0,
+        permission_granted INTEGER NOT NULL DEFAULT 0,
+        parent_consented_at TEXT,
+        child_consented_at TEXT,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS location_requests (
+        request_id TEXT PRIMARY KEY,
+        family_id TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        parent_id TEXT NOT NULL,
+        command_id TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL,
+        result_code TEXT,
+        sample_id TEXT,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS location_requests_device_status ON location_requests(device_id, status, created_at);
+      CREATE TABLE IF NOT EXISTS location_samples (
+        device_id TEXT NOT NULL,
+        sample_id TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        family_id TEXT NOT NULL,
+        captured_at TEXT NOT NULL,
+        received_at TEXT NOT NULL,
+        latitude REAL NOT NULL,
+        longitude REAL NOT NULL,
+        accuracy_m REAL NOT NULL,
+        provider TEXT NOT NULL,
+        battery_pct INTEGER NOT NULL,
+        charging INTEGER NOT NULL,
+        PRIMARY KEY (device_id, sample_id)
+      );
+      CREATE INDEX IF NOT EXISTS location_samples_family_captured ON location_samples(family_id, captured_at);
+      CREATE TABLE IF NOT EXISTS geofence_states (
+        device_id TEXT NOT NULL,
+        geofence_id TEXT NOT NULL,
+        state TEXT NOT NULL,
+        sample_id TEXT NOT NULL,
+        last_sample_at TEXT NOT NULL,
+        distance_m REAL NOT NULL,
+        accuracy_m REAL NOT NULL,
+        PRIMARY KEY (device_id, geofence_id)
+      );
+      CREATE TABLE IF NOT EXISTS location_transitions (
+        transition_id TEXT PRIMARY KEY,
+        family_id TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        geofence_id TEXT NOT NULL,
+        geofence_name TEXT NOT NULL,
+        transition_type TEXT NOT NULL,
+        event_time TEXT NOT NULL,
+        sample_id TEXT NOT NULL,
+        distance_m REAL NOT NULL,
+        accuracy_m REAL NOT NULL,
+        received_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS location_transitions_family_time ON location_transitions(family_id, event_time);
       CREATE TABLE IF NOT EXISTS parent_child_mappings (
         mapping_id TEXT PRIMARY KEY,
         family_id TEXT NOT NULL,
@@ -722,6 +817,38 @@ class Store {
       familyId: row.family_id, memberType: row.member_type, memberId: row.member_id,
       role: row.role, status: row.status, createdAt: row.created_at
     }));
+    this.state.geofences = Object.fromEntries(this.db.prepare("SELECT * FROM geofences ORDER BY created_at, geofence_id").all().map((row) => [row.geofence_id, {
+      geofenceId: row.geofence_id, familyId: row.family_id, name: row.name,
+      latitude: Number(row.latitude), longitude: Number(row.longitude), radiusMeters: Number(row.radius_m),
+      enabled: Boolean(row.enabled), createdByParentId: row.created_by_parent_id || null,
+      createdAt: row.created_at, updatedAt: row.updated_at
+    }]));
+    this.state.locationConsents = Object.fromEntries(this.db.prepare("SELECT * FROM location_consents ORDER BY device_id").all().map((row) => [row.device_id, {
+      deviceId: row.device_id, familyId: row.family_id, parentConsented: Boolean(row.parent_consented),
+      childConsented: Boolean(row.child_consented), permissionGranted: Boolean(row.permission_granted),
+      parentConsentedAt: row.parent_consented_at || null, childConsentedAt: row.child_consented_at || null,
+      updatedAt: row.updated_at
+    }]));
+    this.state.locationRequests = Object.fromEntries(this.db.prepare("SELECT * FROM location_requests ORDER BY created_at").all().map((row) => [row.request_id, {
+      requestId: row.request_id, familyId: row.family_id, deviceId: row.device_id, parentId: row.parent_id,
+      commandId: row.command_id, status: row.status, resultCode: row.result_code || "", sampleId: row.sample_id || "",
+      createdAt: row.created_at, expiresAt: row.expires_at, updatedAt: row.updated_at
+    }]));
+    this.state.locationSamples = Object.fromEntries(this.db.prepare("SELECT * FROM location_samples ORDER BY captured_at").all().map((row) => [`${row.device_id}:${row.sample_id}`, {
+      deviceId: row.device_id, sampleId: row.sample_id, requestId: row.request_id, familyId: row.family_id,
+      capturedAt: row.captured_at, receivedAt: row.received_at, latitude: Number(row.latitude), longitude: Number(row.longitude),
+      accuracyMeters: Number(row.accuracy_m), provider: row.provider, batteryPercent: Number(row.battery_pct), charging: Boolean(row.charging)
+    }]));
+    this.state.geofenceStates = Object.fromEntries(this.db.prepare("SELECT * FROM geofence_states ORDER BY device_id, geofence_id").all().map((row) => [`${row.device_id}:${row.geofence_id}`, {
+      deviceId: row.device_id, geofenceId: row.geofence_id, state: row.state, sampleId: row.sample_id,
+      lastSampleAt: row.last_sample_at, distanceMeters: Number(row.distance_m), accuracyMeters: Number(row.accuracy_m)
+    }]));
+    this.state.locationTransitions = Object.fromEntries(this.db.prepare("SELECT * FROM location_transitions ORDER BY event_time").all().map((row) => [row.transition_id, {
+      transitionId: row.transition_id, familyId: row.family_id, deviceId: row.device_id,
+      geofenceId: row.geofence_id, geofenceName: row.geofence_name, type: row.transition_type,
+      eventTime: row.event_time, sampleId: row.sample_id, distanceMeters: Number(row.distance_m),
+      accuracyMeters: Number(row.accuracy_m), receivedAt: row.received_at
+    }]));
     this.state.parentChildMappings = Object.fromEntries(this.db.prepare("SELECT * FROM parent_child_mappings ORDER BY created_at").all().map((row) => [row.mapping_id, {
       mappingId: row.mapping_id, familyId: row.family_id, parentId: row.parent_id,
       childId: row.child_id, status: row.status, parentConsent: Boolean(row.parent_consent),
@@ -928,7 +1055,7 @@ class Store {
   saveSqlite() {
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.db.exec("DELETE FROM error_app_version_links; DELETE FROM device_error_occurrences; DELETE FROM device_errors; DELETE FROM app_version_changes; DELETE FROM devices; DELETE FROM events; DELETE FROM commands; DELETE FROM approval_requests; DELETE FROM policies; DELETE FROM parent_tokens; DELETE FROM parent_sessions; DELETE FROM pairing_sessions; DELETE FROM families; DELETE FROM parent_profiles; DELETE FROM child_profiles; DELETE FROM family_members; DELETE FROM parent_child_mappings; DELETE FROM consent_requests; DELETE FROM device_notification_keys; DELETE FROM app_versions; DELETE FROM family_policies; DELETE FROM device_policy_assignments; DELETE FROM policy_sync_receipts;");
+      this.db.exec("DELETE FROM error_app_version_links; DELETE FROM device_error_occurrences; DELETE FROM device_errors; DELETE FROM app_version_changes; DELETE FROM devices; DELETE FROM events; DELETE FROM commands; DELETE FROM approval_requests; DELETE FROM policies; DELETE FROM parent_tokens; DELETE FROM parent_sessions; DELETE FROM pairing_sessions; DELETE FROM location_transitions; DELETE FROM geofence_states; DELETE FROM location_samples; DELETE FROM location_requests; DELETE FROM location_consents; DELETE FROM geofences; DELETE FROM families; DELETE FROM parent_profiles; DELETE FROM child_profiles; DELETE FROM family_members; DELETE FROM parent_child_mappings; DELETE FROM consent_requests; DELETE FROM device_notification_keys; DELETE FROM app_versions; DELETE FROM family_policies; DELETE FROM device_policy_assignments; DELETE FROM policy_sync_receipts;");
       const deviceInsert = this.db.prepare("INSERT INTO devices (device_id, child_name, device_name, platform, status, current_app, local_policy_version, last_event_seq, last_seen_at, hmac_secret, public_key, registration_status, registered_at, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
       for (const [deviceId, device] of Object.entries(this.state.devices)) {
         deviceInsert.run(deviceId, device.childName || "자녀", device.deviceName || deviceId, device.platform || "windows", device.status || "running", device.currentApp || "", Number(device.localPolicyVersion || 0), Number(device.lastEventSeq || 0), device.lastSeenAt || nowIso(), this._deviceSecrets.get(deviceId) || null, device.publicKey || null, device.registrationStatus || "unregistered", device.registeredAt || null, JSON.stringify(device.metadata || {}), device.createdAt || device.lastSeenAt || nowIso());
@@ -959,6 +1086,38 @@ class Store {
       for (const session of Object.values(this.state.pairingSessions || {})) pairingInsert.run(session.sessionId, session.issuerType || "child", session.issuerId || "", session.childDeviceId || "", session.codeHash, session.status || "pending", session.parentId || null, session.familyId || null, session.createdAt || nowIso(), Number(session.expiresAt), session.claimedAt || null, session.mappingId || null, session.confirmedAt || null);
       const familyInsert = this.db.prepare("INSERT INTO families (family_id, name, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)");
       for (const family of Object.values(this.state.families || {})) familyInsert.run(family.familyId, family.name || family.familyId, family.status || "active", family.createdAt || nowIso(), family.updatedAt || nowIso());
+      const geofenceInsert = this.db.prepare("INSERT INTO geofences (geofence_id, family_id, name, latitude, longitude, radius_m, enabled, created_by_parent_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const geofence of Object.values(this.state.geofences || {})) geofenceInsert.run(
+        geofence.geofenceId, geofence.familyId, geofence.name, Number(geofence.latitude), Number(geofence.longitude),
+        Number(geofence.radiusMeters), geofence.enabled === false ? 0 : 1, geofence.createdByParentId || null,
+        geofence.createdAt || nowIso(), geofence.updatedAt || nowIso()
+      );
+      const locationConsentInsert = this.db.prepare("INSERT INTO location_consents (device_id, family_id, parent_consented, child_consented, permission_granted, parent_consented_at, child_consented_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const item of Object.values(this.state.locationConsents || {})) locationConsentInsert.run(
+        item.deviceId, item.familyId, item.parentConsented ? 1 : 0, item.childConsented ? 1 : 0,
+        item.permissionGranted ? 1 : 0, item.parentConsentedAt || null, item.childConsentedAt || null, item.updatedAt || nowIso()
+      );
+      const locationRequestInsert = this.db.prepare("INSERT INTO location_requests (request_id, family_id, device_id, parent_id, command_id, status, result_code, sample_id, created_at, expires_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const item of Object.values(this.state.locationRequests || {})) locationRequestInsert.run(
+        item.requestId, item.familyId, item.deviceId, item.parentId, item.commandId, item.status,
+        item.resultCode || null, item.sampleId || null, item.createdAt, item.expiresAt, item.updatedAt || nowIso()
+      );
+      const locationSampleInsert = this.db.prepare("INSERT INTO location_samples (device_id, sample_id, request_id, family_id, captured_at, received_at, latitude, longitude, accuracy_m, provider, battery_pct, charging) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const item of Object.values(this.state.locationSamples || {})) locationSampleInsert.run(
+        item.deviceId, item.sampleId, item.requestId, item.familyId, item.capturedAt, item.receivedAt,
+        Number(item.latitude), Number(item.longitude), Number(item.accuracyMeters), item.provider,
+        Number(item.batteryPercent), item.charging ? 1 : 0
+      );
+      const geofenceStateInsert = this.db.prepare("INSERT INTO geofence_states (device_id, geofence_id, state, sample_id, last_sample_at, distance_m, accuracy_m) VALUES (?, ?, ?, ?, ?, ?, ?)");
+      for (const item of Object.values(this.state.geofenceStates || {})) geofenceStateInsert.run(
+        item.deviceId, item.geofenceId, item.state, item.sampleId, item.lastSampleAt,
+        Number(item.distanceMeters), Number(item.accuracyMeters)
+      );
+      const locationTransitionInsert = this.db.prepare("INSERT INTO location_transitions (transition_id, family_id, device_id, geofence_id, geofence_name, transition_type, event_time, sample_id, distance_m, accuracy_m, received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const item of Object.values(this.state.locationTransitions || {})) locationTransitionInsert.run(
+        item.transitionId, item.familyId, item.deviceId, item.geofenceId, item.geofenceName,
+        item.type, item.eventTime, item.sampleId, Number(item.distanceMeters), Number(item.accuracyMeters), item.receivedAt
+      );
       const parentInsert = this.db.prepare("INSERT INTO parent_profiles (parent_id, family_id, device_fingerprint, public_key, display_name, status, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
       for (const parent of Object.values(this.state.parentProfiles || {})) parentInsert.run(parent.parentId, parent.familyId, parent.deviceFingerprint, parent.publicKey || null, parent.displayName || "부모", parent.status || "active", JSON.stringify(parent.metadata || {}), parent.createdAt || nowIso(), parent.updatedAt || nowIso());
       const childInsert = this.db.prepare("INSERT INTO child_profiles (child_id, device_id, display_name, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)");
@@ -1796,6 +1955,354 @@ class Store {
     const registration = this.getRegistrationStatus(deviceId);
     const confirmed = registration.mappings.find((mapping) => mapping.status === "confirmed");
     return confirmed ? confirmed.familyId : null;
+  }
+
+  listGeofences(familyId) {
+    const target = String(familyId || "");
+    if (!target) return [];
+    return Object.values(this.state.geofences || {})
+      .filter((item) => item.familyId === target)
+      .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)) || a.geofenceId.localeCompare(b.geofenceId))
+      .map(clone);
+  }
+
+  getGeofence(familyId, geofenceId) {
+    const item = this.state.geofences[String(geofenceId || "")];
+    return item && item.familyId === String(familyId || "") ? clone(item) : null;
+  }
+
+  upsertGeofence(input) {
+    const familyId = String(input.familyId || "");
+    if (!familyId || !this.state.families[familyId]) throw new StoreError("family_not_found", 404);
+    const geofenceId = String(input.geofenceId || crypto.randomUUID()).slice(0, 128);
+    const previous = this.state.geofences[geofenceId];
+    if (previous && previous.familyId !== familyId) throw new StoreError("geofence_not_found", 404);
+    const now = nowIso();
+    const geofence = {
+      geofenceId,
+      familyId,
+      name: String(input.name),
+      latitude: Number(input.latitude),
+      longitude: Number(input.longitude),
+      radiusMeters: Number(input.radiusMeters),
+      enabled: input.enabled !== false,
+      createdByParentId: previous ? previous.createdByParentId : (input.parentId || null),
+      createdAt: previous ? previous.createdAt : now,
+      updatedAt: now
+    };
+    this.state.geofences[geofenceId] = geofence;
+    if (previous && (previous.latitude !== geofence.latitude || previous.longitude !== geofence.longitude
+        || previous.radiusMeters !== geofence.radiusMeters || previous.enabled !== geofence.enabled)) {
+      for (const [key, state] of Object.entries(this.state.geofenceStates || {})) {
+        if (state.geofenceId === geofenceId) delete this.state.geofenceStates[key];
+      }
+    }
+    this.save();
+    this.audit("parent", input.parentId || null, previous ? "geofence_updated" : "geofence_created", input.requestId || null, {
+      familyId, geofenceId, radiusMeters: geofence.radiusMeters, enabled: geofence.enabled
+    });
+    return clone(geofence);
+  }
+
+  deleteGeofence(familyId, geofenceId, parentId = null, requestId = null) {
+    const existing = this.state.geofences[String(geofenceId || "")];
+    if (!existing || existing.familyId !== String(familyId || "")) return false;
+    delete this.state.geofences[existing.geofenceId];
+    for (const [key, state] of Object.entries(this.state.geofenceStates || {})) {
+      if (state.geofenceId === existing.geofenceId) delete this.state.geofenceStates[key];
+    }
+    this.save();
+    this.audit("parent", parentId, "geofence_deleted", requestId, { familyId: existing.familyId, geofenceId: existing.geofenceId });
+    return true;
+  }
+
+  getLocationConsent(deviceId, familyId) {
+    const existing = this.state.locationConsents[String(deviceId || "")];
+    if (existing && existing.familyId === String(familyId || "")) return clone(existing);
+    return {
+      deviceId: String(deviceId || ""), familyId: String(familyId || ""),
+      parentConsented: false, childConsented: false, permissionGranted: false,
+      parentConsentedAt: null, childConsentedAt: null, updatedAt: null
+    };
+  }
+
+  setLocationConsent({ deviceId, familyId, actorType, consent, permissionGranted = false, actorId = null, requestId = null }) {
+    const targetDevice = String(deviceId || "");
+    const targetFamily = String(familyId || "");
+    if (!this.state.devices[targetDevice] || !targetFamily || this.familyIdForDevice(targetDevice) !== targetFamily) {
+      throw new StoreError("device_not_found", 404);
+    }
+    if (!["parent", "child"].includes(actorType) || typeof consent !== "boolean") throw new StoreError("invalid_location_consent", 400);
+    if (typeof permissionGranted !== "boolean") throw new StoreError("invalid_location_permission_state", 400);
+    const current = this.getLocationConsent(targetDevice, targetFamily);
+    const now = nowIso();
+    if (actorType === "parent") {
+      current.parentConsented = consent;
+      current.parentConsentedAt = consent ? now : null;
+    } else {
+      current.childConsented = consent;
+      current.permissionGranted = consent && permissionGranted;
+      current.childConsentedAt = consent ? now : null;
+    }
+    current.updatedAt = now;
+    this.state.locationConsents[targetDevice] = current;
+    if (!current.parentConsented || !current.childConsented || !current.permissionGranted) {
+      for (const request of Object.values(this.state.locationRequests || {})) {
+        if (request.deviceId !== targetDevice || !["queued", "deferred"].includes(request.status)) continue;
+        request.status = "cancelled";
+        request.resultCode = "consent_or_permission_revoked";
+        request.updatedAt = now;
+        const command = this.state.commands.find((item) => item.id === request.commandId);
+        if (command && !["succeeded", "failed", "expired"].includes(command.state)) {
+          command.state = "expired";
+          command.status = "expired";
+          command.completedAt = now;
+        }
+      }
+    }
+    this.save();
+    this.audit(actorType, actorId, "location_consent_updated", requestId, {
+      deviceId: targetDevice, familyId: targetFamily, consent, permissionGranted: actorType === "child" && current.permissionGranted
+    });
+    return clone(current);
+  }
+
+  expireLocationRequests(now = Date.now()) {
+    let changed = false;
+    for (const request of Object.values(this.state.locationRequests || {})) {
+      if (!["queued", "deferred"].includes(request.status) || Date.parse(request.expiresAt) > now) continue;
+      request.status = "expired";
+      request.resultCode = "request_expired";
+      request.updatedAt = nowIso();
+      const command = this.state.commands.find((item) => item.id === request.commandId);
+      if (command && !["succeeded", "failed", "expired"].includes(command.state)) {
+        command.state = "expired";
+        command.status = "expired";
+        command.completedAt = request.updatedAt;
+      }
+      changed = true;
+    }
+    return changed;
+  }
+
+  purgeLocationData(now = Date.now()) {
+    const cutoff = now - this.locationRetentionDays * 24 * 60 * 60 * 1000;
+    let changed = this.expireLocationRequests(now);
+    for (const [key, sample] of Object.entries(this.state.locationSamples || {})) {
+      if (Date.parse(sample.capturedAt) < cutoff) {
+        delete this.state.locationSamples[key];
+        changed = true;
+      }
+    }
+    for (const [id, transition] of Object.entries(this.state.locationTransitions || {})) {
+      if (Date.parse(transition.eventTime) < cutoff) {
+        delete this.state.locationTransitions[id];
+        changed = true;
+      }
+    }
+    for (const [key, state] of Object.entries(this.state.geofenceStates || {})) {
+      if (Date.parse(state.lastSampleAt) < cutoff) {
+        delete this.state.geofenceStates[key];
+        changed = true;
+      }
+    }
+    for (const [id, request] of Object.entries(this.state.locationRequests || {})) {
+      if (!["queued", "deferred"].includes(request.status) && Date.parse(request.createdAt) < cutoff) {
+        delete this.state.locationRequests[id];
+        changed = true;
+      }
+    }
+    for (let index = (this.state.commands || []).length - 1; index >= 0; index -= 1) {
+      const command = this.state.commands[index];
+      if (command.type === "location.refresh" && Date.parse(command.createdAt) < cutoff) {
+        this.state.commands.splice(index, 1);
+        changed = true;
+      }
+    }
+    if (this.sqlite && this.db) {
+      const result = this.db.prepare("DELETE FROM audit_log WHERE action IN ('location_request_created', 'location_request_result', 'location_sample_received') AND created_at < ?")
+        .run(new Date(cutoff).toISOString());
+      if (Number(result.changes || 0) > 0) changed = true;
+    }
+    return changed;
+  }
+
+  createLocationRequest({ deviceId, familyId, parentId, expiryMs = 60 * 60 * 1000 }) {
+    const targetDevice = String(deviceId || "");
+    const targetFamily = String(familyId || "");
+    const device = this.state.devices[targetDevice];
+    if (!device || device.platform !== "android" || this.familyIdForDevice(targetDevice) !== targetFamily) {
+      throw new StoreError("device_not_found", 404);
+    }
+    if (this.purgeLocationData()) this.save();
+    const consent = this.getLocationConsent(targetDevice, targetFamily);
+    if (!consent.parentConsented || !consent.childConsented) throw new StoreError("location_consent_required", 409);
+    if (!consent.permissionGranted) throw new StoreError("location_permission_required", 409);
+    const nowMs = Date.now();
+    const active = Object.values(this.state.locationRequests || {}).find((item) => item.deviceId === targetDevice
+      && ["queued", "deferred"].includes(item.status) && Date.parse(item.expiresAt) > nowMs);
+    if (active) {
+      const command = this.state.commands.find((item) => item.id === active.commandId);
+      return { request: clone(active), command: clone(command || null), reused: true };
+    }
+    const createdAt = nowIso();
+    const requestId = crypto.randomUUID();
+    const commandId = crypto.randomUUID();
+    const expiresAt = new Date(nowMs + Math.max(60_000, Math.min(60 * 60 * 1000, Number(expiryMs) || 15 * 60 * 1000))).toISOString();
+    const request = {
+      requestId, familyId: targetFamily, deviceId: targetDevice, parentId: String(parentId || ""),
+      commandId, status: "queued", resultCode: "", sampleId: "", createdAt, expiresAt, updatedAt: createdAt
+    };
+    const command = {
+      id: commandId, deviceId: targetDevice, type: "location.refresh",
+      payload: { request_id: requestId, min_battery_percent: this.locationMinBatteryPercent, charging_override: true },
+      state: "queued", status: "queued", ack: null, result: null, retryCount: 0,
+      maxRetries: this.maxCommandRetries, idempotencyKey: `location-${requestId}`,
+      leaseExpiresAt: null, expiresAt, createdAt, deliveredAt: null, completedAt: null
+    };
+    this.state.locationRequests[requestId] = request;
+    this.state.commands.push(command);
+    this.save();
+    this.audit("parent", parentId, "location_request_created", requestId, {
+      familyId: targetFamily, deviceId: targetDevice, commandId, minBatteryPercent: this.locationMinBatteryPercent
+    });
+    return { request: clone(request), command: clone(command), reused: false };
+  }
+
+  reportLocationRequestResult({ deviceId, requestId, status, code }) {
+    const request = this.state.locationRequests[String(requestId || "")];
+    if (!request || request.deviceId !== String(deviceId || "")) throw new StoreError("location_request_not_found", 404);
+    if (!["deferred", "failed"].includes(status)) throw new StoreError("invalid_location_request_result", 400);
+    if (!["low_battery", "permission_denied", "location_unavailable", "network_unavailable", "unsupported_location", "unknown"].includes(code)) {
+      throw new StoreError("invalid_location_result_code", 400);
+    }
+    if (request.status === "deferred" && status === "deferred" && request.resultCode === code) return clone(request);
+    if (!["queued", "deferred"].includes(request.status)) throw new StoreError("location_request_not_pending", 409);
+    const now = Date.now();
+    const command = this.state.commands.find((item) => item.id === request.commandId);
+    request.resultCode = code;
+    request.updatedAt = nowIso();
+    if (status === "deferred" && Date.parse(request.expiresAt) > now && command) {
+      // The command has been handled; the child schedules a battery/permission-constrained
+      // local retry. Keep the request pending so an eventual one-shot sample can complete it.
+      request.status = "deferred";
+      command.state = "succeeded";
+      command.status = "succeeded";
+      command.ack = { ok: true, state: "location_capture_deferred", reason: code };
+      command.result = { ok: true, state: "location_capture_deferred", reason: code };
+      command.completedAt = request.updatedAt;
+      command.leaseExpiresAt = null;
+    } else {
+      request.status = "failed";
+      if (command) {
+        command.state = "failed";
+        command.status = "failed";
+        command.result = { ok: false, error: code };
+        command.completedAt = request.updatedAt;
+      }
+    }
+    this.save();
+    this.audit("device", deviceId, "location_request_result", requestId, { status: request.status, code });
+    return clone(request);
+  }
+
+  recordLocationSample({ deviceId, sample }) {
+    const targetDevice = String(deviceId || "");
+    const request = this.state.locationRequests[String(sample.requestId || "")];
+    if (!request || request.deviceId !== targetDevice) throw new StoreError("location_request_not_found", 404);
+    const device = this.state.devices[targetDevice];
+    if (!device || device.platform !== "android" || this.familyIdForDevice(targetDevice) !== request.familyId) {
+      throw new StoreError("device_not_found", 404);
+    }
+    const consent = this.getLocationConsent(targetDevice, request.familyId);
+    if (!consent.parentConsented || !consent.childConsented || !consent.permissionGranted) {
+      throw new StoreError("location_consent_required", 403);
+    }
+    const key = `${targetDevice}:${sample.sampleId}`;
+    const existing = this.state.locationSamples[key];
+    if (existing) {
+      if (existing.requestId !== request.requestId) throw new StoreError("location_sample_conflict", 409);
+      return { sample: clone(existing), transitions: [], duplicate: true };
+    }
+    if (!["queued", "deferred"].includes(request.status)) throw new StoreError("location_request_not_pending", 409);
+    const capturedMs = Date.parse(sample.capturedAt);
+    const createdMs = Date.parse(request.createdAt);
+    const expiresMs = Date.parse(request.expiresAt);
+    const nowMs = Date.now();
+    if (capturedMs < createdMs - 60_000 || capturedMs > expiresMs || capturedMs > nowMs + 60_000) {
+      throw new StoreError("location_sample_outside_request_window", 400);
+    }
+    const receivedAt = nowIso();
+    const stored = {
+      ...clone(sample), deviceId: targetDevice, familyId: request.familyId, receivedAt
+    };
+    this.state.locationSamples[key] = stored;
+    const transitions = [];
+    for (const geofence of this.listGeofences(request.familyId).filter((item) => item.enabled)) {
+      const classification = classifyGeofence(geofence, stored);
+      if (classification.state === "uncertain") continue;
+      const stateKey = `${targetDevice}:${geofence.geofenceId}`;
+      const previous = this.state.geofenceStates[stateKey];
+      if (previous && Date.parse(stored.capturedAt) <= Date.parse(previous.lastSampleAt)) continue;
+      if (previous && previous.state !== classification.state) {
+        const transition = {
+          transitionId: crypto.randomUUID(), familyId: request.familyId, deviceId: targetDevice,
+          geofenceId: geofence.geofenceId, geofenceName: geofence.name,
+          type: classification.state === "inside" ? "enter" : "exit",
+          eventTime: stored.capturedAt, sampleId: stored.sampleId,
+          distanceMeters: classification.distanceMeters, accuracyMeters: stored.accuracyMeters, receivedAt
+        };
+        this.state.locationTransitions[transition.transitionId] = transition;
+        transitions.push(clone(transition));
+      }
+      this.state.geofenceStates[stateKey] = {
+        deviceId: targetDevice, geofenceId: geofence.geofenceId, state: classification.state,
+        sampleId: stored.sampleId, lastSampleAt: stored.capturedAt,
+        distanceMeters: classification.distanceMeters, accuracyMeters: stored.accuracyMeters
+      };
+    }
+    request.status = "captured";
+    request.resultCode = "captured";
+    request.sampleId = stored.sampleId;
+    request.updatedAt = receivedAt;
+    const command = this.state.commands.find((item) => item.id === request.commandId);
+    if (command) {
+      command.state = "succeeded";
+      command.status = "succeeded";
+      command.ack = { ok: true, state: "location_uploaded" };
+      command.result = { ok: true, state: "location_uploaded", sample_id: stored.sampleId };
+      command.completedAt = receivedAt;
+      command.leaseExpiresAt = null;
+    }
+    this.purgeLocationData(nowMs);
+    this.save();
+    this.audit("device", targetDevice, "location_sample_received", request.requestId, {
+      sampleId: stored.sampleId, capturedAt: stored.capturedAt, accuracyMeters: stored.accuracyMeters,
+      provider: stored.provider, batteryPercent: stored.batteryPercent, transitionCount: transitions.length
+    });
+    return { sample: clone(stored), transitions, duplicate: false };
+  }
+
+  listLocationTimeline(deviceId, familyId, limit = 100) {
+    const targetDevice = String(deviceId || "");
+    const targetFamily = String(familyId || "");
+    if (!targetDevice || !targetFamily || this.familyIdForDevice(targetDevice) !== targetFamily) {
+      throw new StoreError("device_not_found", 404);
+    }
+    if (this.purgeLocationData()) this.save();
+    const samples = Object.values(this.state.locationSamples || {})
+      .filter((item) => item.deviceId === targetDevice && item.familyId === targetFamily)
+      .sort((a, b) => Date.parse(b.capturedAt) - Date.parse(a.capturedAt))
+      .slice(0, Math.max(1, Math.min(500, Number(limit) || 100)));
+    const transitions = Object.values(this.state.locationTransitions || {})
+      .filter((item) => item.deviceId === targetDevice && item.familyId === targetFamily)
+      .sort((a, b) => Date.parse(b.eventTime) - Date.parse(a.eventTime))
+      .slice(0, Math.max(1, Math.min(500, Number(limit) || 100)));
+    const requests = Object.values(this.state.locationRequests || {})
+      .filter((item) => item.deviceId === targetDevice && item.familyId === targetFamily)
+      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
+      .slice(0, 5);
+    return { samples: clone(samples), transitions: clone(transitions), requests: clone(requests), retentionDays: this.locationRetentionDays };
   }
 
   familyDeviceIds(familyId) {

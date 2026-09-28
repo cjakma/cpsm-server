@@ -5,10 +5,10 @@ const fs = require("fs");
 const crypto = require("crypto");
 
 const projectRoot = path.resolve(__dirname, "..");
-const dataDir = path.join(projectRoot, "smoke-data");
+const dataDir = fs.mkdtempSync(path.join(require("os").tmpdir(), "cpsm-smoke-"));
 const port = 18742;
 
-fs.rmSync(dataDir, { recursive: true, force: true });
+process.on("exit", () => fs.rmSync(dataDir, { recursive: true, force: true }));
 const artifactsDir = path.join(dataDir, "artifacts");
 const cArtifact = Buffer.from("cpsm-c-test-update");
 const pArtifact = Buffer.from("cpsm-p-test-update");
@@ -88,7 +88,7 @@ async function wait() {
 }
 
 async function main() {
-  const child = spawn(process.execPath, ["src/index.js", "--port", String(port), "--data-dir", dataDir], {
+  const child = spawn(process.execPath, ["src/index.js", "--host", "127.0.0.1", "--port", String(port), "--data-dir", dataDir], {
     cwd: projectRoot,
     env: {
       ...process.env,

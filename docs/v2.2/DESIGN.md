@@ -710,10 +710,10 @@ FCM handler, Long Polling endpoint, reverse-proxy timeout과 physical-device 검
 - raw app foreground event: 30일
 - daily aggregate: 1년
 - command/audit: 1년
-- location samples: 7일, opt-in family만
+- location samples: 30일, opt-in family만
 - FCM token: 마지막 사용 후 30일 또는 invalid 즉시 비활성화
 
-보존기간은 구현 전 사용자 승인 또는 별도 설정으로 확정한다.
+위치 표본 보관은 사용자가 30일로 확정했다. 나머지 데이터 범주의 보존기간은 구현 전 사용자 승인 또는 별도 설정으로 확정한다.
 
 ### 하지 않을 것
 

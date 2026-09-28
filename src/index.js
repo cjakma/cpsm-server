@@ -6,6 +6,7 @@ const { FcmSender } = require("./fcm");
 const { Authenticator, AuthError } = require("./auth");
 const { ArtifactStore, ArtifactError } = require("./artifacts");
 const { ScreenTimeError, sanitizeDeviceCommand, sanitizeScreenTime } = require("./screenTime");
+const { LocationError, sanitizeGeofence, sanitizeLocationConsent, sanitizeLocationSample } = require("./location");
 
 const ONLINE_WINDOW_MS = 3 * 60 * 1000;
 const STALE_WINDOW_MS = 30 * 60 * 1000;
@@ -239,10 +240,15 @@ function deviceSummary(store, deviceId) {
     protection: {
       level: String(protection.level || "unknown"),
       reasons: Array.isArray(protection.reasons) ? protection.reasons.slice(0, 10) : [],
-      accessibility: protection.accessibility === undefined ? null : Boolean(protection.accessibility),
+      accessibility: typeof protection.accessibility === "boolean" ? protection.accessibility : null,
+      enforcer: typeof protection.enforcer === "string" ? protection.enforcer : null,
+      boot_id: typeof protection.boot_id === "string" ? protection.boot_id : null,
+      uptime_ms: Number.isSafeInteger(protection.uptime_ms) && protection.uptime_ms >= 0 ? protection.uptime_ms : null,
       device_owner: health.device_owner === undefined ? null : Boolean(health.device_owner),
       usage_access: health.usage_access === undefined ? null : Boolean(health.usage_access),
-      boot_guard_gap_ms: protection.boot_guard_gap_ms === undefined ? null : Number(protection.boot_guard_gap_ms)
+      // Null means readiness has not been measured, never a zero-ms success.
+      boot_guard_gap_ms: Number.isSafeInteger(protection.boot_guard_gap_ms) && protection.boot_guard_gap_ms >= 0
+        ? protection.boot_guard_gap_ms : null
     },
     compatibility: device.platform === "android" ? androidCompatibility(device.metadata || {}) : null,
     metadata: device.metadata || {}
@@ -253,6 +259,14 @@ async function main() {
   const options = parseArgs(process.argv.slice(2));
   const log = logger();
   const store = new Store(path.resolve(options.dataDir));
+  const locationRetentionTimer = setInterval(() => {
+    try {
+      if (store.purgeLocationData()) store.save();
+    } catch (error) {
+      log.warn("location.retention_prune_failed", { code: String(error && error.code || "storage_error") });
+    }
+  }, 60 * 60 * 1000);
+  if (typeof locationRetentionTimer.unref === "function") locationRetentionTimer.unref();
   const fcm = new FcmSender(store, log);
   const auth = new Authenticator({ store, dev: options.dev });
   const artifacts = new ArtifactStore(
@@ -533,6 +547,48 @@ async function main() {
         const mapping = store.setRelationshipConsent({ mappingId: consentRequest.mappingId, recipientType: "child", recipientId: child.childId, consent: value.consent === true || value.decision === "accept" || value.decision === "approve" });
         await fcm.sendToDeviceIds([mapping.parentId], { type: "cpsm_relationship_consent", mapping_id: mapping.mappingId, relationship_status: mapping.status, child_consent: String(mapping.childConsent) }, { title: "CPSM 자녀 동의 상태", body: mapping.status === "confirmed" ? "부모-자녀 관계가 확정되었습니다." : "자녀 동의가 저장되었습니다." });
         sendJson(res, 200, { ok: true, mapping_id: mapping.mappingId, status: mapping.status, parent_consent: mapping.parentConsent, child_consent: mapping.childConsent, policy_ready: mapping.status === "confirmed" });
+        return;
+      }
+
+      const childLocationConsent = pathname.match(/^\/api\/devices\/([^/]+)\/location-consent$/);
+      if (req.method === "POST" && childLocationConsent) {
+        const deviceId = normalizeDeviceId(childLocationConsent[1]);
+        auth.requireDevice(req, deviceId, requestPath, body.raw);
+        const input = sanitizeLocationConsent(value);
+        const prior = store.state.locationConsents[deviceId];
+        const familyId = store.familyIdForDevice(deviceId) || (prior && prior.familyId) || "";
+        if (!familyId) throw new StoreError("parent_mapping_required", 409);
+        const consent = store.setLocationConsent({
+          deviceId, familyId, actorType: "child", consent: input.consent,
+          permissionGranted: input.permissionGranted, actorId: deviceId,
+          requestId: req.headers["x-request-id"] || null
+        });
+        sendJson(res, 200, { ok: true, location_consent: consent });
+        return;
+      }
+
+      const childLocationResult = pathname.match(/^\/api\/devices\/([^/]+)\/location-requests\/([^/]+)\/result$/);
+      if (req.method === "POST" && childLocationResult) {
+        const deviceId = normalizeDeviceId(childLocationResult[1]);
+        auth.requireDevice(req, deviceId, requestPath, body.raw);
+        const request = store.reportLocationRequestResult({
+          deviceId, requestId: decodeURIComponent(childLocationResult[2]),
+          status: value.status, code: value.code
+        });
+        sendJson(res, 200, { ok: true, request });
+        return;
+      }
+
+      const childLocationSample = pathname.match(/^\/api\/devices\/([^/]+)\/location-samples$/);
+      if (req.method === "POST" && childLocationSample) {
+        const deviceId = normalizeDeviceId(childLocationSample[1]);
+        auth.requireDevice(req, deviceId, requestPath, body.raw);
+        const sample = sanitizeLocationSample(value);
+        const result = store.recordLocationSample({ deviceId, sample });
+        sendJson(res, result.duplicate ? 200 : 201, {
+          ok: true, duplicate: result.duplicate, sample_id: result.sample.sampleId,
+          captured_at: result.sample.capturedAt, transitions: result.transitions
+        });
         return;
       }
 
@@ -871,6 +927,88 @@ async function main() {
         if (!store.state.devices[deviceId] || !canAccessDevice(deviceId)) throw new StoreError("device_not_found", 404);
       };
       const familyScope = parentSession && parentSession.family_id ? parentSession.family_id : null;
+      const geofenceRoute = pathname.match(/^\/api\/parent\/geofences(?:\/([^/]+))?$/);
+      if (geofenceRoute && req.method === "GET" && !geofenceRoute[1]) {
+        const session = requireParentProfile();
+        sendJson(res, 200, { geofences: store.listGeofences(session.family_id) });
+        return;
+      }
+      if (geofenceRoute && req.method === "POST" && !geofenceRoute[1]) {
+        const session = requireParentProfile();
+        const geofence = store.upsertGeofence({
+          ...sanitizeGeofence(value), familyId: session.family_id, parentId: session.parent_id,
+          requestId: req.headers["x-request-id"] || null
+        });
+        sendJson(res, 201, { ok: true, geofence });
+        return;
+      }
+      if (geofenceRoute && req.method === "PUT" && geofenceRoute[1]) {
+        const session = requireParentProfile();
+        const geofenceId = decodeURIComponent(geofenceRoute[1]);
+        if (!store.getGeofence(session.family_id, geofenceId)) throw new StoreError("geofence_not_found", 404);
+        const geofence = store.upsertGeofence({
+          ...sanitizeGeofence(value), geofenceId, familyId: session.family_id, parentId: session.parent_id,
+          requestId: req.headers["x-request-id"] || null
+        });
+        sendJson(res, 200, { ok: true, geofence });
+        return;
+      }
+      if (geofenceRoute && req.method === "DELETE" && geofenceRoute[1]) {
+        const session = requireParentProfile();
+        const geofenceId = decodeURIComponent(geofenceRoute[1]);
+        if (!store.deleteGeofence(session.family_id, geofenceId, session.parent_id, req.headers["x-request-id"] || null)) {
+          throw new StoreError("geofence_not_found", 404);
+        }
+        sendJson(res, 200, { ok: true, deleted: true, geofence_id: geofenceId });
+        return;
+      }
+      const parentLocationConsent = pathname.match(/^\/api\/parent\/devices\/([^/]+)\/location-consent$/);
+      if (parentLocationConsent && ["GET", "POST"].includes(req.method)) {
+        const session = requireParentProfile();
+        const deviceId = normalizeDeviceId(parentLocationConsent[1]);
+        requireDeviceAccess(deviceId);
+        const consent = store.getLocationConsent(deviceId, session.family_id);
+        if (req.method === "GET") {
+          sendJson(res, 200, { ok: true, location_consent: consent });
+          return;
+        }
+        const input = sanitizeLocationConsent(value);
+        const updated = store.setLocationConsent({
+          deviceId, familyId: session.family_id, actorType: "parent", consent: input.consent,
+          actorId: session.parent_id, requestId: req.headers["x-request-id"] || null
+        });
+        sendJson(res, 200, { ok: true, location_consent: updated });
+        return;
+      }
+      const parentLocationRequest = pathname.match(/^\/api\/parent\/devices\/([^/]+)\/location-requests$/);
+      if (req.method === "POST" && parentLocationRequest) {
+        const session = requireParentProfile();
+        const deviceId = normalizeDeviceId(parentLocationRequest[1]);
+        requireDeviceAccess(deviceId);
+        const created = store.createLocationRequest({ deviceId, familyId: session.family_id, parentId: session.parent_id });
+        const fcmResult = await fcm.sendToDeviceIds([deviceId], {
+          type: "cpsm_location_refresh"
+        }, undefined, { priority: "high" });
+        sendJson(res, created.reused ? 200 : 202, {
+          ok: true, request: created.request, command_id: created.command.id,
+          reused: created.reused, fcm: { sent: Number(fcmResult.sent || 0), skipped: Number(fcmResult.skipped || 0), failed: Number(fcmResult.failed || 0) }
+        });
+        return;
+      }
+      const parentLocationTimeline = pathname.match(/^\/api\/parent\/devices\/([^/]+)\/location-timeline$/);
+      if (req.method === "GET" && parentLocationTimeline) {
+        const session = requireParentProfile();
+        const deviceId = normalizeDeviceId(parentLocationTimeline[1]);
+        requireDeviceAccess(deviceId);
+        const limit = Number(requestUrl.searchParams.get("limit") || 100);
+        if (!Number.isInteger(limit) || limit < 1 || limit > 500) throw new LocationError("invalid_location_timeline_limit", 400);
+        const timeline = store.listLocationTimeline(deviceId, session.family_id, limit);
+        sendJson(res, 200, {
+          ok: true, device_id: deviceId, location_consent: store.getLocationConsent(deviceId, session.family_id),
+          retention_days: timeline.retentionDays, samples: timeline.samples, transitions: timeline.transitions, requests: timeline.requests
+        });
+        return;
+      }
       if (req.method === "POST" && pathname === "/api/parent/pairing-sessions") {
         const session = requireParentProfile();
         const pairing = store.createPairingSession({ issuerType: "parent", issuerId: session.parent_id, familyId: session.family_id });
@@ -1119,7 +1257,7 @@ async function main() {
       sendJson(res, 404, { ok: false, error: "not_found" });
     } catch (error) {
       const known = error instanceof AuthError || error instanceof StoreError
-        || error instanceof ArtifactError || error instanceof ScreenTimeError;
+        || error instanceof ArtifactError || error instanceof ScreenTimeError || error instanceof LocationError;
       const status = known ? error.status : 500;
       const code = known ? error.code : "internal_error";
       if (status >= 500) log.error("request.failed", { code });

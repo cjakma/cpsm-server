@@ -105,6 +105,15 @@ function sanitizeDeviceCommand(input) {
     // 0 means "until the parent unlocks".
     payload.minutes = intInRange(input.minutes, 0, 1440, "invalid_lock_minutes");
   }
+  if (type === "device.unlock") {
+    // Omitted/0 clears the manual lock only. Positive minutes grants temporary
+    // freedom from screen-time limits; do not coerce invalid wire types to zero.
+    const minutes = input.minutes === undefined ? 0 : input.minutes;
+    if (!Number.isInteger(minutes) || minutes < 0 || minutes > 1440) {
+      throw new ScreenTimeError("invalid_unlock_minutes");
+    }
+    payload.minutes = minutes;
+  }
   if (type === "screen_time.bonus") {
     payload.minutes = intInRange(input.minutes, 1, 240, "invalid_bonus_minutes");
   }

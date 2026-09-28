@@ -1,6 +1,6 @@
 # cpsm-server
 
-`cpsm-server`는 CPSM의 중앙 서버입니다. 지금 단계에서는 동시 접속자 4명 수준을 전제로 단일 Node.js 프로세스와 파일 저장소를 사용하지만, 프로토콜은 이후 동접 5만 명 규모로 PostgreSQL, Redis, Queue, WebSocket Gateway를 분리하기 쉬운 형태로 잡았습니다.
+`cpsm-server`는 CPSM의 중앙 서버입니다. 현재는 단일 Node.js 프로세스와 SQLite canonical store로 인증, 관계·동의, 정책, 명령, 이벤트, 위치 이력을 처리합니다. 향후 PostgreSQL, Redis, queue, WebSocket gateway로 분리할 수 있도록 클라이언트 프로토콜을 유지합니다.
 
 ## 역할
 
@@ -9,6 +9,8 @@
 - 부모앱 `cpsm-p`에서 작성한 정책 규칙 저장 및 버전 관리
 - 자녀 기기의 `/sync` 요청에 정책 변경 여부와 명령 큐 반환
 - `monitor`, `block`, `require_approval` 이벤트 처리
+- 가족별 안심구역, 위치 양측 동의, 1회 위치 요청/표본/타임라인과 보수적인 geofence 전이
+- 완료된 위치 표본·전이·요청·명령 및 관련 audit의 기본 30일 보관 정리
 - 부모 기기로 FCM data message 발송 시도
 - 부모의 허락/종료 결정을 자녀 기기 명령으로 변환
 
@@ -20,7 +22,7 @@
 
 ```text
 현재 MVP:
-cpsm-c/cpsm-m -> cpsm-server(Node) -> file store + FCM
+cpsm-c/cpsm-m -> cpsm-server(Node) -> SQLite + optional FCM wake-up
 
 확장 목표:
 cpsm-c/cpsm-m -> API Gateway -> App Server
@@ -67,6 +69,12 @@ POST /api/parent/pairing-sessions
 GET  /api/parent/pairing-sessions/{id}
 POST /api/parent/pairing-sessions/{id}/claim
 POST /api/parent/pairing-sessions/{id}/confirm
+GET  /api/parent/geofences
+POST /api/parent/geofences
+GET  /api/parent/devices/{deviceId}/location-consent
+POST /api/parent/devices/{deviceId}/location-consent
+POST /api/parent/devices/{deviceId}/location-requests
+GET  /api/parent/devices/{deviceId}/location-timeline
 ```
 
 `/api/parent/blocked-apps`는 기존 부모앱 UI 호환을 위해 이름을 유지합니다. 현재 응답 내용은 차단 목록만이 아니라 `monitor`, `block`, `require_approval` 전체 정책 규칙입니다. QR pairing의 관계 확정은 claim preview와 스캔한 기기의 단일 confirm 뒤에만 허용됩니다.
@@ -134,7 +142,7 @@ npm run dev
 http://127.0.0.1:18732
 ```
 
-## FCM 설정
+## FCM 설정 및 경계
 
 Firebase Admin SDK service account 파일은 아래 경로를 기본으로 사용합니다.
 
@@ -156,7 +164,25 @@ $env:GOOGLE_APPLICATION_CREDENTIALS='C:\path\firebase-service-account.json'
 $env:FIREBASE_PROJECT_ID='your-firebase-project-id'
 ```
 
-현재 `CPSM_FCM_ENABLED=0`이며, service account가 없거나 부모 FCM token이 등록되지 않으면 실제 발송 대신 `data\notifications.ndjson`에 fallback payload를 기록합니다. 서비스 계정 JSON과 private key는 `secrets/` 또는 secret store에만 두고 commit하지 않습니다.
+Android 앱의 `google-services.json`은 Firebase **클라이언트 설정**이며 server sender credential가 아닙니다. 실제 server 발송에는 Admin SDK service-account JSON과 `CPSM_FCM_ENABLED=1`이 필요합니다.
+
+현재 운영 `/api/status`는 `fcmEnabled: false`를 반환합니다. 이번 Android OTA APK는 FCM token 등록/wake-up 코드를 포함하지만 server sender는 활성화하지 않았으므로 실제 push는 아직 전송되지 않습니다. 자녀의 주기적 서명 HTTPS sync가 명령 수신 fallback입니다. 위치 FCM payload에는 wake-up type만 싣고 위치 좌표·request ID는 넣지 않습니다.
+
+서비스 계정 파일은 `cpsm-server/secrets/firebase-adminsdk.json` 또는 `GOOGLE_APPLICATION_CREDENTIALS`로 지정한 secret-store 경로에서 읽습니다. 서비스 계정 JSON과 private key는 저장소에 넣거나 README·채팅·APK에 기록하지 않습니다.
+
+## 현재 공개된 Android OTA artifacts
+
+아래 값은 공개 HTTPS manifest와 다운로드 alias를 읽어 확인했습니다. 두 클라이언트는 OTA check를 켜고 빌드했으며 package/version/size/SHA-256/signer를 APK 자체와 대조했습니다.
+
+- CPSM-m: `com.cpsm.child`, `0.2.3-fcm-wakeup` (versionCode `21`), 4,662,950 bytes, SHA-256 `71edc6d5224a8d066320c6de2836790ca6ba22f814b12fe000ee415d8e5dc268`
+  - Manifest: `https://pm-oci.duckdns.org/cpsm-api/api/updates/android/cpsm-m/manifest.json`
+  - Download: `https://pm-oci.duckdns.org/cpsm-api/api/updates/android/cpsm-m/latest.apk`
+- CPSM-p: `com.cpsm.parents`, `0.2.5-fcm-wakeup` (versionCode `25`), 8,510,183 bytes, SHA-256 `508049a1ea0bbf09eb94b0ae51ddd8b394586da83e6335457ebe99a2507867e1`
+  - Manifest: `https://pm-oci.duckdns.org/cpsm-api/api/updates/android/cpsm-p/manifest.json`
+  - Download: `https://pm-oci.duckdns.org/cpsm-api/api/updates/android/cpsm-p/latest.apk`
+- Both APKs use signing certificate SHA-256 `6c28052e2c1eb827cdddaa8931e1d2b30c260cadcd0f237113d30b6d04905d3c`.
+
+The FCM data-only wake-up remains best-effort; authenticated sync is authoritative. OTA distribution is not proof of physical installation or FCM delivery.
 
 ## 이벤트 흐름
 
@@ -165,7 +191,7 @@ $env:FIREBASE_PROJECT_ID='your-firebase-project-id'
 3. `cpsm-c` 또는 `cpsm-m`이 `/sync`에서 새 정책 버전을 확인합니다.
 4. 자녀 기기가 `/policy`를 다운로드해 로컬에 저장합니다.
 5. 자녀 기기에서 정책 대상 앱이 실행되면 action에 따라 이벤트를 서버로 보냅니다.
-6. 서버는 부모에게 FCM data message를 보냅니다.
+6. FCM sender가 설정된 경우에만 server가 부모에게 최소 FCM data message를 보냅니다. 현재 운영에서는 disabled이며 authenticated API polling/sync가 fallback입니다.
 7. `require_approval`이면 부모가 허락 또는 종료를 선택합니다.
 8. 서버는 `app.allow.temporary` 또는 `app.terminate` 명령을 자녀 기기 큐에 넣습니다.
 9. 자녀 기기가 다음 `/sync` 또는 command poll에서 명령을 받아 실행합니다.

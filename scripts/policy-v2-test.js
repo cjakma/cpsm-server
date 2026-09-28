@@ -7,14 +7,15 @@ const crypto = require("crypto");
 const { canonicalJson } = require("../src/store");
 
 const projectRoot = path.resolve(__dirname, "..");
-const dataDir = path.join(projectRoot, "smoke-data-v2");
+const dataDir = fs.mkdtempSync(path.join(require("os").tmpdir(), "cpsm-v2-"));
 process.on("exit", () => fs.rmSync(dataDir, { recursive: true, force: true }));
 const port = 18743;
 const adminToken = crypto.randomBytes(24).toString("hex");
 
-fs.rmSync(dataDir, { recursive: true, force: true });
 
+let assertionCount = 0;
 function assert(condition, message) {
+  assertionCount += 1;
   if (!condition) throw new Error(`assertion failed: ${message}`);
 }
 
@@ -95,7 +96,7 @@ async function wait() {
 }
 
 async function main() {
-  const server = spawn(process.execPath, ["src/index.js", "--port", String(port), "--data-dir", dataDir], {
+  const server = spawn(process.execPath, ["src/index.js", "--host", "127.0.0.1", "--port", String(port), "--data-dir", dataDir], {
     cwd: projectRoot,
     env: { ...process.env, CPSM_DISABLE_FCM: "1", CPSM_AUTH_MODE: "strict", CPSM_ADMIN_TOKEN: adminToken, CPSM_ARTIFACTS_DIR: path.join(dataDir, "artifacts"), NODE_ENV: "production" },
     stdio: "ignore"
@@ -126,6 +127,77 @@ async function main() {
     const devicesB = await ok("GET", "/api/parent/devices", undefined, parentB);
     assert(devicesB.devices.length === 0, "other family device list empty");
     results.familyIsolation = "enforced";
+
+    // 2b. Family-scoped safe-zone CRUD and strict geographic/radius validation.
+    assert((await raw("GET", "/api/parent/geofences")).status === 401, "unauthenticated geofence read denied");
+    const geofenceBody = { name: "집", latitude: 37.5, longitude: 127.0, radius_m: 1000 };
+    const createdGeofence = await raw("POST", "/api/parent/geofences", geofenceBody, parentA);
+    assert(createdGeofence.status === 201 && createdGeofence.body.geofence.radiusMeters === 1000, "minimum radius geofence created");
+    const geofenceId = createdGeofence.body.geofence.geofenceId;
+    const geofencesA = await ok("GET", "/api/parent/geofences", undefined, parentA);
+    assert(geofencesA.geofences.length === 1 && geofencesA.geofences[0].name === "집", "parent sees own geofence");
+    assert((await ok("GET", "/api/parent/geofences", undefined, parentB)).geofences.length === 0, "foreign family cannot read geofence");
+    for (const invalidBody of [
+      { ...geofenceBody, radius_m: 999 }, { ...geofenceBody, radius_m: 20001 },
+      { ...geofenceBody, radius_m: "1000" }, { ...geofenceBody, latitude: 90.1 },
+      { ...geofenceBody, longitude: -180.1 }, { ...geofenceBody, enabled: "false" },
+      { ...geofenceBody, name: "   " }
+    ]) {
+      const invalidGeofence = await raw("POST", "/api/parent/geofences", invalidBody, parentA);
+      assert(invalidGeofence.status === 400, `invalid geofence rejected ${JSON.stringify(invalidBody)}`);
+    }
+    const expandedGeofence = await raw("PUT", `/api/parent/geofences/${geofenceId}`, { ...geofenceBody, radius_m: 20000, enabled: false }, parentA);
+    assert(expandedGeofence.status === 200 && expandedGeofence.body.geofence.radiusMeters === 20000 && !expandedGeofence.body.geofence.enabled, "maximum radius and disabled state update");
+    assert((await raw("PUT", `/api/parent/geofences/${geofenceId}`, { ...geofenceBody, radius_m: 1000 }, parentB)).status === 404, "foreign family cannot update geofence");
+    assert((await raw("DELETE", `/api/parent/geofences/${geofenceId}`, undefined, parentB)).status === 404, "foreign family cannot delete geofence");
+    const deletedGeofence = await ok("DELETE", `/api/parent/geofences/${geofenceId}`, undefined, parentA);
+    assert(deletedGeofence.deleted && (await ok("GET", "/api/parent/geofences", undefined, parentA)).geofences.length === 0, "geofence deletion readback");
+    results.geofences = "auth_family_scope_1000_20000m_validation_crud";
+
+    // 2c. Location requires both family-parent consent and child consent + permission.
+    assert((await raw("GET", `/api/parent/devices/${phone.deviceId}/location-consent`, undefined, parentA)).body.location_consent.parentConsented === false, "location consent starts disabled");
+    const requestWithoutConsent = await raw("POST", `/api/parent/devices/${phone.deviceId}/location-requests`, {}, parentA);
+    assert(requestWithoutConsent.status === 409 && requestWithoutConsent.body.error === "location_consent_required", "location request denied without both consents");
+    const childLocationConsent = await phone.signed("POST", `/api/devices/${phone.deviceId}/location-consent`, { consent: true, permission_granted: true });
+    assert(childLocationConsent.status === 200 && childLocationConsent.body.location_consent.childConsented, "child location consent recorded");
+    const parentLocationConsent = await ok("POST", `/api/parent/devices/${phone.deviceId}/location-consent`, { consent: true }, parentA);
+    assert(parentLocationConsent.location_consent.parentConsented && parentLocationConsent.location_consent.permissionGranted, "parent consent activates after child permission");
+    assert((await raw("POST", `/api/parent/devices/${phone.deviceId}/location-consent`, { consent: true }, parentB)).status === 404, "foreign family cannot consent for child device");
+
+    const homeZone = await ok("POST", "/api/parent/geofences", { name: "location-test-home", latitude: 37.5, longitude: 127, radius_m: 1000 }, parentA);
+    async function captureLocation(latitude, suffix, offsetMs) {
+      const request = await raw("POST", `/api/parent/devices/${phone.deviceId}/location-requests`, {}, parentA);
+      assert(request.status === 202 && request.body.request.status === "queued", `location request ${suffix} queued`);
+      const commandSync = await phone.signed("POST", `/api/devices/${phone.deviceId}/sync`, { platform: "android", local_policy_version: 0, status: {} });
+      assert(commandSync.body.commands.some((command) => command.id === request.body.command_id && command.type === "location.refresh"), `location command ${suffix} delivered on pull`);
+      const sampleId = `location-${suffix}-${crypto.randomUUID()}`;
+      const capturedAt = new Date(Date.now() + offsetMs).toISOString();
+      const upload = await phone.signed("POST", `/api/devices/${phone.deviceId}/location-samples`, {
+        sample_id: sampleId, request_id: request.body.request.requestId, captured_at: capturedAt,
+        latitude, longitude: 127, accuracy_m: 10, provider: "gps", battery_pct: 80, charging: false
+      });
+      assert(upload.status === 201, `location sample ${suffix} stored`);
+      return { request, sampleId, capturedAt, upload };
+    }
+    const loc1 = await captureLocation(37.5, "inside", 0);
+    assert(loc1.upload.body.transitions.length === 0, "first location sample establishes zone baseline");
+    const loc2 = await captureLocation(37.52, "outside", 1000);
+    assert(loc2.upload.body.transitions[0].type === "exit", "outside point crosses geofence boundary");
+    const loc3 = await captureLocation(37.5, "return", 2000);
+    assert(loc3.upload.body.transitions[0].type === "enter", "inside point re-enters geofence");
+    const duplicateSample = await phone.signed("POST", `/api/devices/${phone.deviceId}/location-samples`, {
+      sample_id: loc3.sampleId, request_id: loc3.request.body.request.requestId, captured_at: loc3.capturedAt,
+      latitude: 37.5, longitude: 127, accuracy_m: 10, provider: "gps", battery_pct: 80, charging: false
+    });
+    assert(duplicateSample.status === 200 && duplicateSample.body.duplicate, "location upload retry is idempotent");
+    const locationTimeline = await ok("GET", `/api/parent/devices/${phone.deviceId}/location-timeline?limit=10`, undefined, parentA);
+    assert(locationTimeline.samples.length === 3 && locationTimeline.transitions.length === 2, "parent timeline reads samples and transitions");
+    assert(Date.parse(locationTimeline.samples[0].capturedAt) > Date.parse(locationTimeline.samples[2].capturedAt), "timeline orders by captured timestamp");
+    assert((await raw("GET", `/api/parent/devices/${phone.deviceId}/location-timeline`, undefined, parentB)).status === 404, "location history hidden from another family");
+    const revokedConsent = await phone.signed("POST", `/api/devices/${phone.deviceId}/location-consent`, { consent: false, permission_granted: false });
+    assert(!revokedConsent.body.location_consent.childConsented, "child can revoke location consent");
+    assert((await raw("POST", `/api/parent/devices/${phone.deviceId}/location-requests`, {}, parentA)).status === 409, "revoked child consent stops new requests");
+    results.location = "dual_consent_queue_upload_timestamp_timeline_geofence_transitions_idempotent";
 
     // 3. Unauthenticated re-registration cannot replace an enrolled key.
     const hijack = keyDevice(phone.deviceId, "android");
@@ -190,6 +262,50 @@ async function main() {
     assert(commandList.commands.find((command) => command.id === lock.command.id).state === "succeeded", "lock acknowledged");
     results.commands = "lock_delivered_and_acknowledged";
 
+    // Unlock contract: zero clears only manual lock; positive grants bounded freedom.
+    const commandPath = `/api/parent/devices/${phone.deviceId}/commands`;
+    const unlocks = [];
+    for (const minutes of [0, 1, 60, 1440]) {
+      const body = { type: "device.unlock", minutes, idempotency_key: `unlock-${minutes}` };
+      const queued = await raw("POST", commandPath, body, parentA);
+      assert(queued.status === 201 && queued.body.command.payload.minutes === minutes, `unlock ${minutes} forwarded`);
+      const command = queued.body.command;
+      assert(Date.parse(command.expiresAt) - Date.parse(command.createdAt) === 3600000, "unlock delivery expiry remains one hour");
+      const retry = await ok("POST", commandPath, body, parentA);
+      assert(retry.command.id === command.id, "unlock retry is idempotent");
+      unlocks.push(command);
+    }
+    const defaultUnlock = await ok("POST", commandPath, { type: "device.unlock" }, parentA);
+    assert(defaultUnlock.command.payload.minutes === 0, "legacy omitted minutes clears manual lock only");
+    const beforeInvalid = (await ok("GET", commandPath, undefined, parentA)).commands.length;
+    for (const minutes of [-1, 0.5, 1441, "60", "", null, true, [], {}]) {
+      const invalidUnlock = await raw("POST", commandPath, { type: "device.unlock", minutes }, parentA);
+      assert(invalidUnlock.status === 400 && invalidUnlock.body.error === "invalid_unlock_minutes", `invalid unlock ${JSON.stringify(minutes)} rejected`);
+    }
+    assert((await ok("GET", commandPath, undefined, parentA)).commands.length === beforeInvalid, "invalid unlocks queue no commands");
+    assert((await raw("POST", commandPath, { type: "device.unlock", minutes: 60, idempotency_key: "unlock-60" }, parentB)).status === 404, "foreign family cannot reuse unlock idempotency key");
+    assert((await raw("POST", commandPath, { type: "device.unlock", minutes: 60 })).status === 401, "unauthenticated unlock denied");
+    const unlockSync = await phone.signed("POST", `/api/devices/${phone.deviceId}/sync`, { platform: "android", local_policy_version: phonePolicy.version, status: {} });
+    assert(unlockSync.status === 200, "signed unlock sync accepted");
+    for (const command of unlocks) {
+      assert(unlockSync.body.commands.some((item) => item.id === command.id && item.payload.minutes === command.payload.minutes), "unlock duration delivered intact");
+    }
+    const foreignSync = await pc.signed("POST", `/api/devices/${pc.deviceId}/sync`, { platform: "windows", local_policy_version: pcPolicy.version, status: {} });
+    assert(!foreignSync.body.commands.some((item) => unlocks.some((unlock) => unlock.id === item.id)), "unlock not delivered to another device");
+    results.unlockContract = { valid: 4, invalid: 9, legacyDefault: 0 };
+
+    // Protection metadata must survive the summary without null becoming zero.
+    for (const gap of [null, 0, 41000]) {
+      const protection = { level: gap === null ? "unprotected" : "protected", reasons: gap === null ? ["enforcer_not_ready"] : [], accessibility: gap !== null, enforcer: gap === null ? "none" : "accessibility", boot_id: "test-boot", boot_guard_gap_ms: gap, uptime_ms: 45000 };
+      const screenTime = { used_today_minutes: 12, daily_limit_minutes: 120, state: "allowed" };
+      const healthSync = await phone.signed("POST", `/api/devices/${phone.deviceId}/sync`, { platform: "android", local_policy_version: phonePolicy.version, status: { health: { protection, screen_time: screenTime } } });
+      assert(healthSync.status === 200, "health sync accepted");
+      const summary = (await ok("GET", "/api/parent/devices", undefined, parentA)).devices.find((item) => item.device_id === phone.deviceId);
+      for (const [key, value] of Object.entries(protection)) assert(JSON.stringify(summary.protection[key]) === JSON.stringify(value), `protection ${key} preserved for ${gap}`);
+      assert(JSON.stringify(summary.screen_time) === JSON.stringify(screenTime), "screen_time unchanged");
+    }
+    results.protectionSummary = "null_zero_measured_and_metadata_preserved";
+
     // 6. Android events queued locally are ingested through sync and acknowledged.
     const eventSync = (await phone.signed("POST", `/api/devices/${phone.deviceId}/sync`, {
       platform: "android", local_policy_version: phonePolicy.version, status: {},
@@ -221,7 +337,7 @@ async function main() {
     const phoneSummary = devicesA.devices.find((device) => device.device_id === phone.deviceId);
     assert(devicesA.devices.length === 2 && phoneSummary.presence === "online", "family devices listed");
     results.deviceList = devicesA.devices.map((device) => `${device.platform}:${device.presence}`);
-    console.log(JSON.stringify({ ok: true, ...results }, null, 2));
+    console.log(JSON.stringify({ ok: true, assertions: assertionCount, isolatedDataDir: dataDir, ...results }, null, 2));
   } finally {
     server.kill();
   }

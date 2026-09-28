@@ -137,7 +137,7 @@ class FcmSender {
     return Boolean(this.configured && this.serviceAccount && this.projectId);
   }
 
-  async sendToDeviceIds(deviceIds, data, notification) {
+  async sendToDeviceIds(deviceIds, data, notification, options = {}) {
     const wanted = new Set((deviceIds || []).filter(Boolean).map(String));
     const keys = Object.values(this.store.state.notificationKeys || {}).filter((item) => wanted.has(String(item.deviceId)) && item.status === "active");
     if (!keys.length) {
@@ -162,7 +162,14 @@ class FcmSender {
         await requestJson(
           "POST",
           `https://fcm.googleapis.com/v1/projects/${encodeURIComponent(this.projectId)}/messages:send`,
-          { message: { token: key.token, notification, data } },
+          {
+            message: {
+              token: key.token,
+              ...(notification ? { notification } : {}),
+              data,
+              ...(options.priority === "high" ? { android: { priority: "HIGH" } } : {})
+            }
+          },
           { authorization: `Bearer ${accessToken}` },
           this.timeoutMs
         );
