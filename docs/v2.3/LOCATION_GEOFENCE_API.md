@@ -4,7 +4,14 @@
 
 서버에는 가족별 안심구역 CRUD, 양측 위치 동의, durable `location.refresh` 요청, 표본 업로드, 타임라인과 안심구역 전이 API가 추가됐다. CPSM-m에는 자녀 동의/철회 UI, Android 권한 보고, 30% 배터리 조건의 WorkManager 1회 GPS 캡처·재시도, FCM wake-up handler가 구현됐고, 부모 앱에는 동의/요청/이력 화면이 추가됐다. 앱 빌드와 서버 격리 테스트는 통과했지만 실제 기기 동작은 검증되지 않았다.
 
-로컬 앱 모듈에는 각 패키지와 일치하는 Firebase Android 설정 파일이 권한 600으로 배치되고 Git에서 제외된다. Google Services plugin/BOM 설정에 따라 두 Android debug build는 FCM token 등록·수신 코드를 활성화한다. 실제 서비스의 FCM 발송은 별도 Firebase Admin SDK service-account credential과 `CPSM_FCM_ENABLED=1`이 필요하므로 운영 서버는 이 작업에서 활성화하지 않았다. 새 위치 API도 운영 서버에는 배포하지 않았다.
+로컬 앱 모듈에는 각 패키지와 일치하는 Firebase Android 설정 파일이 권한 600으로 배치되고 Git에서 제외된다. Google Services plugin/BOM 설정에 따라 두 Android debug build는 FCM token 등록·수신 코드를 활성화한다. 실제 서비스의 FCM 발송은 별도 Firebase Admin SDK service-account credential과 `CPSM_FCM_ENABLED=1`이 필요하므로 운영 서버는 계속 비활성이다.
+
+## Production 배포 readback (2026-09-28)
+
+- Live PM2 `cpsm-server`를 location API/schema 코드로 재기동했다. 공개 `GET /api/status`는 HTTP 200, `storage=sqlite`, `fcmEnabled=false`를 반환했다.
+- SQLite additive migration 후 32 tables가 확인됐다. 새 geofence/location tables 6개가 생성됐고 당시 row 수는 0이었다. `PRAGMA quick_check`는 `ok`, `foreign_key_check`는 0건, 기존 devices/families/family_members/mapping 행 수는 배포 전과 같았다.
+- 운영 protected geofence/timeline 경로의 무인증 요청은 `401 invalid_bearer_token`으로 거부됐다. 전체 authenticated location/GPS flow는 실제 기기에서 아직 검증하지 않았다.
+- Server FCM sender는 계속 disabled이며 Admin SDK credential을 배포하지 않았다. Signed HTTPS polling/sync fallback을 유지한다.
 
 ## API
 
@@ -46,6 +53,6 @@ SQLite에는 `geofences` 테이블을 additive하게 생성한다. 저장은 fam
 
 - Google/Naver 임베디드 지도 SDK/key 선정 및 실제 지도 렌더링
 - 자녀 FCM 설정/토큰 등록/발송의 실기기 검증과 배터리·위치 권한별 WorkManager 재시도 검증
-- 새 API 운영 배포 및 public-service readback (별도 승인 필요)
+- 위치 동의·요청·GPS sample upload를 실기기에서 end-to-end 검증
 - Android API 26–36 대상 실기기 위치·권한·재부팅 검증
 - 위치정보 보관/동의 정책의 출시 전 개인정보·위치정보 법률 검토
