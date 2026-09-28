@@ -181,8 +181,9 @@ Android 앱의 `google-services.json`은 Firebase **클라이언트 설정**이�
   - Manifest: `https://pm-oci.duckdns.org/cpsm-api/api/updates/android/cpsm-p/manifest.json`
   - Download: `https://pm-oci.duckdns.org/cpsm-api/api/updates/android/cpsm-p/latest.apk`
 - Both APKs use signing certificate SHA-256 `6c28052e2c1eb827cdddaa8931e1d2b30c260cadcd0f237113d30b6d04905d3c`.
+- Both were built as Gradle `debug` variants (`debuggable=true`) to match the existing OTA signing continuity. They are internal OTA artifacts, not hardened Play Store release builds; physical installer acceptance remains unverified.
 
-The FCM data-only wake-up remains best-effort; authenticated sync is authoritative. OTA distribution is not proof of physical installation or FCM delivery.
+The FCM data-only wake-up remains best-effort; authenticated sync is authoritative. OTA APKs are live, but the running server still lacks the newly added location routes; location consent/request/history therefore remains unavailable until a separate backend rollout. This README release entry documents client delivery, not end-to-end feature availability.
 
 ## 이벤트 흐름
 
