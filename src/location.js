@@ -51,8 +51,10 @@ function sanitizeLocationSample(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new LocationError("invalid_location_sample", 400);
   const sampleId = typeof input.sample_id === "string" ? input.sample_id.trim() : "";
   const requestId = typeof input.request_id === "string" ? input.request_id.trim() : "";
+  const captureType = input.capture_type === undefined ? "parent_request" : input.capture_type;
   if (!sampleId || sampleId.length > 128) throw new LocationError("invalid_location_sample_id", 400);
-  if (!requestId || requestId.length > 128) throw new LocationError("invalid_location_request_id", 400);
+  if (!["parent_request", "scheduled"].includes(captureType)) throw new LocationError("invalid_location_capture_type", 400);
+  if ((captureType === "parent_request" && !requestId) || requestId.length > 128) throw new LocationError("invalid_location_request_id", 400);
   if (typeof input.captured_at !== "string" || !Number.isFinite(Date.parse(input.captured_at))) {
     throw new LocationError("invalid_location_timestamp", 400);
   }
@@ -69,6 +71,7 @@ function sanitizeLocationSample(input) {
   return {
     sampleId,
     requestId,
+    captureType,
     capturedAt: new Date(Date.parse(input.captured_at)).toISOString(),
     latitude,
     longitude,

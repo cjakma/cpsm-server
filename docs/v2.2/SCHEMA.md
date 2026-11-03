@@ -29,10 +29,16 @@ A confirmed relationship makes a policy assignment eligible; it does not claim t
 - `events`: child events and health observations.
 - `commands`: parent-to-child commands and acknowledgements.
 - `approval_requests`: app-launch approval workflow.
+- `missions`: family-owned text assignments to one currently confirmed Android child, including explicit bonus minutes and mission status.
+- `mission_submissions`: text-only child submissions; rejection reactivates the mission while retaining earlier submission history.
+- `mission_reviews`: one parent approve/reject decision per submission.
+- `mission_rewards`: one reward ledger row per approved submission. Zero-minute praise has a ledger row and no command; positive bonuses reference an idempotent `screen_time.bonus` command.
+- `mission_create_requests`: scoped `(family_id, parent_id, request_id)` UUID mapping to a SHA-256 fingerprint of the normalized create payload and the original mission ID.
 - `parent_sessions`: short-lived parent bearer-session hashes.
 - `pairing_sessions`: short-lived, one-time bidirectional pairing sessions issued by either parent or child. Stores issuer type/id, pairing-code hash, claimed mapping ID, and confirmation status; the authenticated opposite role must claim it before the preview confirmation can finalize the mapping.
 - `parent_tokens`: legacy/global parent notification-token compatibility.
 - `audit_log`: lifecycle and administrative audit events.
+- Mission lifecycle audit metadata contains identifiers/decisions only; it excludes mission instructions, submission text, and review notes. The JSON fallback retains a bounded 10,000-entry audit log.
 - `request_nonces`: replay protection for device-signed requests.
 - `storage_meta`: migration/initialization marker.
 

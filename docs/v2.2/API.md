@@ -61,6 +61,8 @@ X-CPSM-Device-Signature:  base64(sign_sha256(privateKey, METHOD \n path \n times
 | GET | `/api/devices/{id}/policy` | 📱 | 정책 본문 |
 | POST | `/api/devices/{id}/events` | 📱 | 이벤트 업로드 |
 | POST | `/api/devices/{id}/errors` | 📱 | 클라이언트 오류 보고 (202) |
+| GET/POST | `/api/devices/{id}/app-install-requests` | 📱 | 자녀 앱 설치 요청 목록/생성 (확정된 Android 기기만) |
+| POST | `/api/devices/{id}/app-install-requests/{requestId}/cancel` | 📱 | 대기 중인 자녀 앱 설치 요청 취소 |
 | POST | `/api/devices/{id}/notification-key` | 📱 | FCM 토큰 등록 |
 | POST | `/api/devices/{id}/consent-requests/{rid}/decision` | 📱 | 자녀 측 동의 |
 | GET | `/api/devices/{id}/commands/poll` | 📱 | 명령 큐 |
@@ -85,6 +87,13 @@ X-CPSM-Device-Signature:  base64(sign_sha256(privateKey, METHOD \n path \n times
 | GET | `/api/parent/approval-requests[/{id}]` | 👪 | 허락 요청 |
 | POST | `/api/parent/approval-requests/{id}/decision` | 👪 | 허락/종료 결정 |
 | POST | `/api/parent/approval-requests/{id}/allow\|terminate` | 👪 | 위의 단축형 |
+| GET | `/api/parent/app-install-requests?status=pending|all` | 👪 | 가족 범위 앱 설치 요청 검토 목록 |
+| POST | `/api/parent/app-install-requests/{requestId}/decision` | 👪 | 앱 설치 요청 승인/거절 (설치 명령 없음) |
+| POST/GET | `/api/parent/missions` | 👪 | 확인된 Android 자녀 텍스트 미션 생성/가족 목록 |
+| POST | `/api/parent/missions/{missionId}/cancel` | 👪 | 활성 미션 취소 |
+| POST | `/api/parent/missions/{missionId}/review` | 👪 | 제출 승인/거절과 보상 원장 기록 |
+| GET | `/api/devices/{deviceId}/missions?status=all|active` | 📱 | 현재 확인된 자녀의 미션 조회 |
+| POST | `/api/devices/{deviceId}/missions/{missionId}/submissions` | 📱 | 텍스트 메시지 제출 |
 | GET | `/api/parent/policies/current` | 👪 | 현재 정책 |
 | POST / PUT | `/api/parent/policies` / `/api/parent/policies/current` | 👪 | 정책 저장 (버전 증가) |
 | GET/POST | `/api/parent/blocked-apps` | 👪 | 규칙 목록 / 규칙 추가 (이름은 호환용, 내용은 전체 규칙) |
@@ -96,6 +105,10 @@ X-CPSM-Device-Signature:  base64(sign_sha256(privateKey, METHOD \n path \n times
 | PATCH | `/api/admin/app-versions/{product}/{platform}/{versionCode}/changes/{changeId}` | 🛡 | 변경 검증 표시 |
 | GET | `/api/admin/errors?product=&status=&limit=&cursor=` | 🛡 | 클라이언트 오류 목록 |
 | GET/PATCH | `/api/admin/errors/{id}` | 🛡 | 오류 상세/상태 변경 |
+
+앱 설치 요청 상세 필드·검증·상태 전이와 Android 사용자 설치 확인 계약은 [APP_INSTALL_REQUESTS.md](APP_INSTALL_REQUESTS.md)를 참조한다. 부모 승인 응답의 `requires_user_installer_confirmation: true`는 자녀가 Play Store를 열고 Android의 사용자 승인형 Package Installer로 설치를 마쳐야 함을 뜻하며, 서버는 설치 명령을 큐에 넣지 않는다.
+
+미션 상세 계약: `POST /api/parent/missions`는 `{request_id,device_id,title,instructions,bonus_minutes}`를 받습니다. 필수 UUID인 `request_id`는 가족/부모 범위에서 payload fingerprint와 함께 저장되며 같은 키/같은 정규화 payload 재시도는 기존 미션을 반환하고, 다른 payload는 `409 mission_request_id_conflict`입니다. 보너스는 명시적 정수 0–240(기본값 없음)입니다. `title` ≤80, `instructions` ≤1000, 제출 `message` ≤2000, 검토 `note` ≤500. 미션과 제출은 텍스트 전용이며 미디어/첨부 필드는 400으로 거절됩니다. 상태 및 관계/가족 범위 규칙, 승인 재시도와 보상 idempotency는 [../API.md](../API.md#가족-범위-텍스트-미션)를 참조하세요. SQLite `mission_rewards` ledger는 승인 제출마다 한 건이며, 양수 보너스만 `screen_time.bonus` command를 생성하고 0분은 command 없이 praise-only로 남습니다. 만료된 queued 미전달 보상은 다음 poll 때 같은 명령 ID/key로 TTL을 갱신합니다. mission lifecycle audit에는 식별자/결정만 저장하고 미션 안내, 제출 본문, 검토 메모는 저장하지 않습니다.
 
 ### QR pairing 상태 통지 경계
 

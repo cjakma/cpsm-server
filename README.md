@@ -250,3 +250,11 @@ GET  /api/parent/devices/{deviceId}/commands
 npm run smoke      # 기존 흐름
 npm run test:v2    # strict 인증: 스코프/가족 격리, 탈취·재페어링 거부, 정책 v2 서명, 이벤트 ack, 시간요청 승인, 잠금 전달·ack
 ```
+
+## 2026-11-03 추가 — 공동 보호자 초대 · 규칙 변경 FCM
+- `POST /api/parent/family-invites` → `{invite_id, invite_code, expires_at}` (10분, 1회용, 메모리에만 보관 — 재시작하면 무효).
+- `POST /api/parent/family-invites/{id}/accept {invite_code}` → 다른 부모가 가족에 `guardian` 으로 참가. 코드 틀림 403, 만료·재사용 410, 같은 가족 409, **이미 자녀가 있는 부모 409 `parent_family_has_children`**. 참가자의 옛 세션은 폐기(`reenroll_required: true`), 재등록해도 역할 유지. 초대한 부모에게 `cpsm_family_member_joined`.
+- 규칙 저장(`PUT /api/parent/policies/current`, `POST /api/parent/blocked-apps`) 시 같은 가족의 **다른** 부모에게 FCM `cpsm_policy_changed {family_id, policy_version}`(데이터만), 응답에 `parents_notified`.
+- 시험: `npm run test:family-invite`(17 assertions). 전체 `check`·smoke·location·v2·app-install-requests·missions 통과.
+
+**배포 상태 (2026-11-03)**: 운영 `/home/ubuntu/web-service/cpsm-server` 는 아직 **2026-09-28 코드**다. 2026-10-15 작업(미션·앱 설치 요청·정기 위치 `capture_type`)과 이 변경은 저장소에만 있고 운영 반영 전이다. 운영 FCM 은 꺼져 있다(`CPSM_DISABLE_FCM=1`, `secrets/firebase-adminsdk.json` 없음 — Firebase 프로젝트 `childrens-pc-sec-monit` Admin SDK 키 필요). 배포 전 백업: `/home/ubuntu/web-service-archive/cpsm-server-deploy-backup-20261103/`.

@@ -1,6 +1,6 @@
 # CPSM server data model
 
-The server uses SQLite at `data/cpsm.sqlite`. `state.json` remains a compatibility fallback when the Node SQLite runtime is unavailable. The private policy-signing key is stored beside the database and is not part of an archive or API response.
+The server uses SQLite at `data/cpsm.sqlite`. `state.json` remains a compatibility fallback when the Node SQLite runtime is unavailable. The private policy-signing key is stored beside the database and is not part of an archive or API response. The current visual ERD is [`docs/ERD_CURRENT.md`](docs/ERD_CURRENT.md); the current route contract is [`docs/API_SPEC_CURRENT.md`](docs/API_SPEC_CURRENT.md).
 
 ## Identity and membership
 
@@ -29,12 +29,20 @@ A confirmed relationship makes a policy assignment eligible; it does not claim t
 - `events`: child events and health observations.
 - `commands`: parent-to-child commands and acknowledgements.
 - `approval_requests`: app-launch approval workflow.
+- `app_install_requests`: separate, family-scoped Android app-install requests and parent decisions. A parent approval records permission only; it never creates an install command, and the child must complete the Android user-controlled Play Store/Package Installer flow.
+- `missions`: text-only assignments owned by a family and assigned to one currently confirmed Android child; stores selected bonus minutes and active/pending_review/completed/cancelled state.
+- `mission_submissions`: text-only child messages with pending_review/approved/rejected state. Rejection reactivates the mission, retaining earlier submissions.
+- `mission_reviews`: one immutable parent approve/reject decision per submission.
+- `mission_rewards`: one ledger entry per approved submission, including praise-only zero-minute approvals. A positive reward references its separate `screen_time.bonus` command.
+- `mission_create_requests`: `(family_id, parent_id, request_id)` scoped UUID mapping with a SHA-256 fingerprint of the normalized payload and the resulting mission ID.
 - `parent_sessions`: short-lived parent bearer-session hashes.
 - `pairing_sessions`: short-lived, one-time bidirectional pairing sessions issued by either parent or child. Stores issuer type/id, pairing-code hash, claimed mapping ID, and confirmation status; the authenticated opposite role must claim it before the preview confirmation can finalize the mapping.
 - `parent_tokens`: legacy/global parent notification-token compatibility.
 - `audit_log`: lifecycle and administrative audit events.
 - `request_nonces`: replay protection for device-signed requests.
 - `storage_meta`: migration/initialization marker.
+
+Mission reads and writes require the parent's active membership in the current family or the child's active confirmed Android relationship and active family membership. Old mission history is hidden when that relationship is no longer current. Bonus minutes are explicit (0–240); zero creates a ledger entry but no command. Positive approvals create the ledger and command in one persistence commit, with command idempotency key `mission-reward:<submission_id>`. An expired queued reward that has never been delivered renews its expiry at the next device poll without changing its ID/key. Lifecycle audit events contain identifiers/decisions only, not instructions, submission text, or review notes; JSON fallback audit history is bounded to the latest 10,000 entries.
 
 ## Lifecycle
 

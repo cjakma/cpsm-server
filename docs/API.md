@@ -1,7 +1,7 @@
 # cpsm-server API 명세
 
-> 기준: `src/index.js`, `src/auth.js`, `src/store.js` (git 저장소 아님 · package `cpsm-server`) · 갱신 2026-09-25
-> 저장 스키마: [../SCHEMA.md](../SCHEMA.md) · 배포: [../DEPLOYMENT.md](../DEPLOYMENT.md)
+> 기준: `src/index.js`, `src/auth.js`, `src/store.js` (git 저장소 아님 · package `cpsm-server`) · 갱신 2026-10-14
+> 현재 API 연동 규격: [API_SPEC_CURRENT.md](API_SPEC_CURRENT.md) · 현재 ERD: [ERD_CURRENT.md](ERD_CURRENT.md) · 저장 스키마: [../SCHEMA.md](../SCHEMA.md) · 배포: [../DEPLOYMENT.md](../DEPLOYMENT.md)
 
 CPSM(자녀 PC·모바일 보호) 중앙 서버. 자녀 기기(`cpsm-c` Windows, `cpsm-m` Android)는 정책을 동기화하고
 이벤트를 올리며, 부모앱(`cpsm-p`)은 최초 실행 시 Android Keystore 기기로 자동 등록되고, QR 양방향 pairing·이름 preview·스캔 기기의 단일 확인 이후 규칙 작성·허락/종료 결정을 한다.
@@ -61,6 +61,8 @@ X-CPSM-Device-Signature:  base64(sign_sha256(privateKey, METHOD \n path \n times
 | GET | `/api/devices/{id}/policy` | 📱 | 정책 본문 |
 | POST | `/api/devices/{id}/events` | 📱 | 이벤트 업로드 |
 | POST | `/api/devices/{id}/errors` | 📱 | 클라이언트 오류 보고 (202) |
+| POST/GET | `/api/devices/{id}/app-install-requests` | 📱 | Android 앱 설치 요청 생성/조회 |
+| POST | `/api/devices/{id}/app-install-requests/{requestId}/cancel` | 📱 | 대기 중인 본인 요청 취소 |
 | POST | `/api/devices/{id}/notification-key` | 📱 | FCM 토큰 등록 |
 | POST | `/api/devices/{id}/consent-requests/{rid}/decision` | 📱 | 자녀 측 동의 |
 | GET | `/api/devices/{id}/commands/poll` | 📱 | 명령 큐 |
@@ -96,6 +98,13 @@ X-CPSM-Device-Signature:  base64(sign_sha256(privateKey, METHOD \n path \n times
 | PATCH | `/api/admin/app-versions/{product}/{platform}/{versionCode}/changes/{changeId}` | 🛡 | 변경 검증 표시 |
 | GET | `/api/admin/errors?product=&status=&limit=&cursor=` | 🛡 | 클라이언트 오류 목록 |
 | GET/PATCH | `/api/admin/errors/{id}` | 🛡 | 오류 상세/상태 변경 |
+| GET | `/api/parent/app-install-requests?status=` | 👪 | 가족 자녀 요청 목록 (`pending` 또는 `all`) |
+| POST | `/api/parent/app-install-requests/{requestId}/decision` | 👪 | 요청 승인/거절 기록 |
+| POST/GET | `/api/parent/missions` | 👪 | 확인된 Android 자녀 대상 텍스트 미션 생성/가족 목록 |
+| POST | `/api/parent/missions/{missionId}/cancel` | 👪 | 활성 미션 취소 |
+| POST | `/api/parent/missions/{missionId}/review` | 👪 | 대기 중인 제출 승인/거절 및 보상 기록 |
+| GET | `/api/devices/{deviceId}/missions?status=all|active` | 📱 | 현재 가족의 자녀 미션 목록 |
+| POST | `/api/devices/{deviceId}/missions/{missionId}/submissions` | 📱 | 텍스트 제출 |
 
 ### QR pairing 상태 통지 경계
 
@@ -169,6 +178,30 @@ curl -s -X POST https://pm-oci.duckdns.org/cpsm-api/api/devices/win-home-01/sync
 ```
 
 ## 5. 부모앱
+
+### 가족 범위 텍스트 미션
+
+미션은 텍스트 전용이며 이미지/사진/오디오/비디오/파일/첨부 업로드 필드를 받지 않습니다. 부모는 현재 가족의 활성 멤버여야 하고, 대상은 현재 확인된 가족 관계에 속한 Android 자녀여야 합니다. `request_id`는 필수 UUID이며, `(family_id,parent_id,request_id)`와 정규화 payload fingerprint로 생성 요청을 멱등 처리합니다. 같은 키/같은 payload 재시도는 기존 미션을 반환하고, 같은 키/다른 payload는 `409 mission_request_id_conflict`입니다. `title`은 1–80자, `instructions`는 1–1000자, `bonus_minutes`는 반드시 명시하는 정수 0–240입니다. 0은 칭찬 전용이며 기본 보너스는 없습니다.
+
+```http
+POST /api/parent/missions
+{"request_id":"550e8400-e29b-41d4-a716-446655440000","device_id":"android-child-1","title":"책상 정리","instructions":"책상을 정리하고 완료 메시지를 보내 주세요.","bonus_minutes":15}
+GET /api/parent/missions?status=all
+POST /api/parent/missions/{missionId}/cancel
+GET /api/devices/{deviceId}/missions?status=active
+POST /api/devices/{deviceId}/missions/{missionId}/submissions
+{"message":"책상을 정리했어요."}
+POST /api/parent/missions/{missionId}/review
+{"submission_id":"...","decision":"approve","note":"수고했어요"}
+```
+
+제출 메시지는 1–2000자, 검토 메모는 0–500자입니다. 부모가 `approve` 또는 `reject`를 명시해야 합니다. 거절은 미션을 다시 `active`로 만들고 제출/검토 이력을 보존합니다. 승인만 보상을 부여하며, 보상 원장과 명령은 별도 `mission_rewards` / `commands` 레코드입니다. 양수 보너스는 idempotency key `mission-reward:<submission_id>`인 기존 `screen_time.bonus` 명령 하나로 전달되고, 0분은 원장만 만들며 명령을 생성하지 않습니다. 만료된 미전달 queued 미션 보상은 다음 기기 poll에서 같은 명령 ID/key로 TTL을 갱신하며, 그 밖의 명령 만료 규칙은 변하지 않습니다. 동일 제출/결정의 승인 재시도는 동일한 결과를 돌려줍니다. 생성/취소/텍스트 제출/승인/거절 audit에는 식별자와 결정 메타데이터만 기록하며, 미션 안내·제출 본문·검토 메모는 넣지 않습니다.
+
+상태: 미션 `active | pending_review | completed | cancelled`, 제출 `pending_review | approved | rejected`. 부모 목록은 `all | active | pending_review | completed | cancelled`, 자녀 목록은 `all | active`를 지원합니다. 관계가 해제되거나 현재 가족이 바뀌면 예전 미션 내역은 노출되지 않습니다.
+
+### Android 앱 설치 요청
+
+자녀 기기는 확인된 가족 연결 이후 `POST /api/devices/{deviceId}/app-install-requests`로 package name, 앱 이름, 요청 이유를 제출하고, 같은 경로의 `GET`으로 본인 요청 상태를 확인합니다. 보호자는 가족 범위의 `GET /api/parent/app-install-requests`로 조회한 뒤 `POST /api/parent/app-install-requests/{requestId}/decision`에서 `approve` 또는 `deny`를 기록합니다. 보호자 승인은 설치 명령이 아니며, 자녀가 Play Store와 Android 설치 확인을 직접 완료해야 합니다. 상세 계약은 [`docs/v2.2/APP_INSTALL_REQUESTS.md`](v2.2/APP_INSTALL_REQUESTS.md)를 참고하세요.
 
 ### 등록 (세션 발급)
 ```bash

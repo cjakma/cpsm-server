@@ -29,7 +29,11 @@ function raw(method, pathname, body, headers = {}) {
       let data = "";
       res.setEncoding("utf8");
       res.on("data", (chunk) => { data += chunk; });
-      res.on("end", () => resolve({ status: res.statusCode, body: data ? JSON.parse(data) : {} }));
+      res.on("end", () => resolve({
+        status: res.statusCode,
+        body: data ? JSON.parse(data) : {},
+        retryAfter: res.headers["retry-after"] || ""
+      }));
     });
     req.on("error", reject);
     req.end(payload);
@@ -96,19 +100,40 @@ async function wait() {
 }
 
 async function main() {
-  const server = spawn(process.execPath, ["src/index.js", "--host", "127.0.0.1", "--port", String(port), "--data-dir", dataDir], {
+  let server = null;
+  const launchServer = () => spawn(process.execPath, ["src/index.js", "--host", "127.0.0.1", "--port", String(port), "--data-dir", dataDir], {
     cwd: projectRoot,
-    env: { ...process.env, CPSM_DISABLE_FCM: "1", CPSM_AUTH_MODE: "strict", CPSM_ADMIN_TOKEN: adminToken, CPSM_ARTIFACTS_DIR: path.join(dataDir, "artifacts"), NODE_ENV: "production" },
+    env: {
+      ...process.env, CPSM_DISABLE_FCM: "1", CPSM_AUTH_MODE: "strict", CPSM_ADMIN_TOKEN: adminToken,
+      CPSM_LOCATION_SAMPLE_INTERVAL_MS: "3600000",
+      CPSM_ARTIFACTS_DIR: path.join(dataDir, "artifacts"), NODE_ENV: "production"
+    },
     stdio: "ignore"
   });
+  const stopServer = async () => {
+    if (!server || server.exitCode !== null) return;
+    const child = server;
+    await new Promise((resolve) => {
+      child.once("exit", resolve);
+      child.kill();
+    });
+  };
+  const restartServer = async () => {
+    await stopServer();
+    server = launchServer();
+    await wait();
+  };
+  server = launchServer();
   const results = {};
   try {
     await wait();
     const parentA = await enrollParent("parent-a");
     const parentB = await enrollParent("parent-b");
     const phone = keyDevice(`android-${crypto.randomUUID()}`, "android");
+    const phone2 = keyDevice(`android-${crypto.randomUUID()}`, "android");
     const pc = keyDevice(`windows-${crypto.randomUUID()}`, "windows");
     await pair(parentA, phone);
+    await pair(parentA, phone2);
     await pair(parentA, pc);
 
     // 1. A parent session is not an admin credential.
@@ -162,12 +187,22 @@ async function main() {
     assert(childLocationConsent.status === 200 && childLocationConsent.body.location_consent.childConsented, "child location consent recorded");
     const parentLocationConsent = await ok("POST", `/api/parent/devices/${phone.deviceId}/location-consent`, { consent: true }, parentA);
     assert(parentLocationConsent.location_consent.parentConsented && parentLocationConsent.location_consent.permissionGranted, "parent consent activates after child permission");
+    const childConsentReadback = await phone.signed("GET", `/api/devices/${phone.deviceId}/location-consent`);
+    assert(childConsentReadback.status === 200 && childConsentReadback.body.location_consent.parentConsented
+      && childConsentReadback.body.location_consent.childConsented,
+    `child can signed-read current server consent before a scheduled capture: ${JSON.stringify(childConsentReadback)}`);
+    const parentTokenRegistration = await raw("POST", "/api/parent/devices/fcm-token", { fcm_token: "test-parent-token-family-a" }, parentA);
+    assert(parentTokenRegistration.status === 200, "parent FCM token is associated with authenticated parent profile");
     assert((await raw("POST", `/api/parent/devices/${phone.deviceId}/location-consent`, { consent: true }, parentB)).status === 404, "foreign family cannot consent for child device");
 
     const homeZone = await ok("POST", "/api/parent/geofences", { name: "location-test-home", latitude: 37.5, longitude: 127, radius_m: 1000 }, parentA);
     async function captureLocation(latitude, suffix, offsetMs) {
       const request = await raw("POST", `/api/parent/devices/${phone.deviceId}/location-requests`, {}, parentA);
       assert(request.status === 202 && request.body.request.status === "queued", `location request ${suffix} queued`);
+      const duplicateRequest = await raw("POST", `/api/parent/devices/${phone.deviceId}/location-requests`, {}, parentA);
+      assert(duplicateRequest.status === 200 && duplicateRequest.body.reused
+        && duplicateRequest.body.request.requestId === request.body.request.requestId,
+      `active location request ${suffix} is reused without a new command`);
       const commandSync = await phone.signed("POST", `/api/devices/${phone.deviceId}/sync`, { platform: "android", local_policy_version: 0, status: {} });
       assert(commandSync.body.commands.some((command) => command.id === request.body.command_id && command.type === "location.refresh"), `location command ${suffix} delivered on pull`);
       const sampleId = `location-${suffix}-${crypto.randomUUID()}`;
@@ -177,6 +212,8 @@ async function main() {
         latitude, longitude: 127, accuracy_m: 10, provider: "gps", battery_pct: 80, charging: false
       });
       assert(upload.status === 201, `location sample ${suffix} stored`);
+      if (suffix === "inside") assert(upload.body.parent_refresh_fcm.skipped === 1,
+        "location upload targets the active family parent key for data-only refresh when FCM transport is disabled");
       return { request, sampleId, capturedAt, upload };
     }
     const loc1 = await captureLocation(37.5, "inside", 0);
@@ -184,15 +221,28 @@ async function main() {
     const loc2 = await captureLocation(37.52, "outside", 1000);
     assert(loc2.upload.body.transitions[0].type === "exit", "outside point crosses geofence boundary");
     const loc3 = await captureLocation(37.5, "return", 2000);
-    assert(loc3.upload.body.transitions[0].type === "enter", "inside point re-enters geofence");
+    assert(loc3.upload.body.transitions[0].type === "enter", "inside point re-enters geofence boundary");
+    const scheduledUpload = await phone.signed("POST", `/api/devices/${phone.deviceId}/location-samples`, {
+      sample_id: `scheduled-${crypto.randomUUID()}`, capture_type: "scheduled", captured_at: new Date(Date.now() + 3000).toISOString(),
+      latitude: 37.5, longitude: 127, accuracy_m: 15, provider: "network", battery_pct: 80, charging: false
+    });
+    assert(scheduledUpload.status === 201 && scheduledUpload.body.capture_type === "scheduled",
+      "periodic location upload has a distinct capture type and no parent request");
+    assert(scheduledUpload.body.parent_refresh_fcm.skipped === 1,
+      "periodic location upload triggers a silent family-scoped parent refresh attempt");
+    const immediateAgain = await raw("POST", `/api/parent/devices/${phone.deviceId}/location-requests`, {}, parentA);
+    assert(immediateAgain.status === 202 && immediateAgain.body.reused === false,
+      "manual current-location refresh is allowed immediately after a completed request");
     const duplicateSample = await phone.signed("POST", `/api/devices/${phone.deviceId}/location-samples`, {
       sample_id: loc3.sampleId, request_id: loc3.request.body.request.requestId, captured_at: loc3.capturedAt,
       latitude: 37.5, longitude: 127, accuracy_m: 10, provider: "gps", battery_pct: 80, charging: false
     });
     assert(duplicateSample.status === 200 && duplicateSample.body.duplicate, "location upload retry is idempotent");
     const locationTimeline = await ok("GET", `/api/parent/devices/${phone.deviceId}/location-timeline?limit=10`, undefined, parentA);
-    assert(locationTimeline.samples.length === 3 && locationTimeline.transitions.length === 2, "parent timeline reads samples and transitions");
+    assert(locationTimeline.samples.length === 4 && locationTimeline.transitions.length === 2, "parent timeline reads scheduled and requested samples plus transitions");
+    assert(locationTimeline.sample_interval_ms === 60 * 60 * 1000, "timeline reports sampling interval, not a manual-request cooldown");
     assert(Date.parse(locationTimeline.samples[0].capturedAt) > Date.parse(locationTimeline.samples[2].capturedAt), "timeline orders by captured timestamp");
+    assert(locationTimeline.samples.some((sample) => sample.captureType === "scheduled"), "parent timeline can distinguish scheduled samples");
     assert((await raw("GET", `/api/parent/devices/${phone.deviceId}/location-timeline`, undefined, parentB)).status === 404, "location history hidden from another family");
     const revokedConsent = await phone.signed("POST", `/api/devices/${phone.deviceId}/location-consent`, { consent: false, permission_granted: false });
     assert(!revokedConsent.body.location_consent.childConsented, "child can revoke location consent");
@@ -214,9 +264,16 @@ async function main() {
     // 4. Screen-time policy v2.
     const invalid = await raw("PUT", "/api/parent/policies/current", { rules: [], screenTime: { downtime: [{ start: "25:00", end: "07:00" }] } }, parentA);
     assert(invalid.status === 400 && invalid.body.error === "invalid_downtime_time", "invalid downtime rejected");
+    const foreignPolicyTarget = await raw("PUT", "/api/parent/policies/current", {
+      rules: [{ id: "foreign-target", name: "targeted rule", platform: "android", device_id: phone.deviceId,
+        action: "block", match: { type: "package", packageName: "org.example.targeted" } }]
+    }, parentB);
+    assert(foreignPolicyTarget.status === 403 && foreignPolicyTarget.body.error === "policy_rule_device_not_in_family",
+      "family cannot target a device outside its confirmed membership");
     await ok("PUT", "/api/parent/policies/current", {
       rules: [
         { id: "yt", name: "YouTube", platform: "android", action: "monitor", dailyLimitMinutes: 45, match: { type: "package", packageName: "com.google.android.youtube" } },
+        { id: "phone-only", name: "Child-only app", platform: "android", device_id: phone.deviceId, action: "block", match: { type: "package", packageName: "org.example.childonly" } },
         { id: "steam", name: "steam.exe", platform: "windows", action: "block" }
       ],
       screenTime: { dailyLimitMinutes: 120, downtime: [{ days: [1, 2, 3, 4, 5], start: "22:00", end: "07:00" }], alwaysAllowed: { windows: ["cpsm-c.exe"] } }
@@ -235,7 +292,15 @@ async function main() {
     const phonePolicy = (await phone.signed("GET", phoneSync.policy.download_url)).body;
     assert(phonePolicy.schemaVersion === 2 && phonePolicy.screenTime.dailyLimitMinutes === 120, "phone screen time delivered");
     assert(phonePolicy.screenTime.alwaysAllowed.includes("com.android.dialer"), "android default allowlist");
-    assert(phonePolicy.appRules.length === 1 && phonePolicy.appRules[0].dailyLimitMinutes === 45, "android per-app limit");
+    assert(phonePolicy.appRules.length === 2 && phonePolicy.appRules.find((rule) => rule.id === "yt").dailyLimitMinutes === 45,
+      "android shared and targeted rules delivered to their target");
+    assert(phonePolicy.appRules.some((rule) => rule.id === "phone-only"), "targeted rule delivered to intended child");
+    const phone2Sync = (await phone2.signed("POST", `/api/devices/${phone2.deviceId}/sync`, {
+      platform: "android", local_policy_version: 0, status: {}
+    })).body;
+    const phone2Policy = (await phone2.signed("GET", phone2Sync.policy.download_url)).body;
+    assert(phone2Policy.appRules.length === 1 && phone2Policy.appRules[0].id === "yt",
+      "targeted rule omitted from sibling device policy");
     const unsigned = { ...phonePolicy };
     for (const key of ["canonicalHash", "canonical_hash", "signatureAlgorithm", "signature_algorithm", "signatureMetadata", "signature_metadata", "signature", "keyId", "key_id"]) delete unsigned[key];
     const signatureValid = crypto.verify(null, Buffer.from(canonicalJson(unsigned)), crypto.createPublicKey(current.publicKey),
@@ -335,11 +400,11 @@ async function main() {
     // 7. Parent device list.
     const devicesA = await ok("GET", "/api/parent/devices", undefined, parentA);
     const phoneSummary = devicesA.devices.find((device) => device.device_id === phone.deviceId);
-    assert(devicesA.devices.length === 2 && phoneSummary.presence === "online", "family devices listed");
+    assert(devicesA.devices.length === 3 && phoneSummary.presence === "online", "family devices listed");
     results.deviceList = devicesA.devices.map((device) => `${device.platform}:${device.presence}`);
     console.log(JSON.stringify({ ok: true, assertions: assertionCount, isolatedDataDir: dataDir, ...results }, null, 2));
   } finally {
-    server.kill();
+    await stopServer();
   }
 }
 

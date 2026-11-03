@@ -100,6 +100,21 @@ function bodyObject(body) {
   return body;
 }
 
+function validateMissionBody(body, allowedFields) {
+  bodyObject(body);
+  const mediaField = /(image|photo|audio|voice|video|media|file|attachment|upload|blob|uri|url|mime.?type)/i;
+  const inspect = (value) => {
+    if (!value || typeof value !== "object") return;
+    for (const [key, nested] of Object.entries(value)) {
+      if (mediaField.test(key)) throw new StoreError("mission_media_not_supported", 400);
+      inspect(nested);
+    }
+  };
+  inspect(body);
+  const extra = Object.keys(body).find((key) => !allowedFields.includes(key));
+  if (extra) throw new StoreError("unexpected_mission_field", 400);
+}
+
 function androidCompatibility(metadata = {}) {
   const apiLevel = Number(metadata.android_api_level || 0);
   if (!apiLevel) return { status: "unknown", apiLevel: 0, minSupportedApi: 26, testedThroughApi: 36 };
@@ -140,10 +155,13 @@ function sanitizeRules(rules) {
     if (!Number.isInteger(dailyLimitMinutes) || dailyLimitMinutes < 0 || dailyLimitMinutes > 1440) {
       throw new StoreError("invalid_rule_daily_limit", 400);
     }
+    const targetValue = String(rule.device_id || rule.deviceId || "").trim();
+    const deviceId = targetValue ? normalizeDeviceId(targetValue) : "";
     return {
       id: String(rule.id || crypto.randomUUID()).slice(0, 128),
       name,
       platform,
+      ...(deviceId ? { deviceId } : {}),
       match,
       action,
       ...(dailyLimitMinutes > 0 ? { dailyLimitMinutes } : {}),
@@ -151,6 +169,16 @@ function sanitizeRules(rules) {
       reason: String(rule.reason || "parent_policy").slice(0, 256)
     };
   });
+}
+
+function validatePolicyRuleTargets(store, parentSession, rules) {
+  if (!parentSession) return;
+  const familyDeviceIds = new Set(store.familyDeviceIds(parentSession.family_id));
+  for (const rule of rules) {
+    if (rule.deviceId && !familyDeviceIds.has(rule.deviceId)) {
+      throw new StoreError("policy_rule_device_not_in_family", 403);
+    }
+  }
 }
 
 function normalizeDeviceId(value) {
@@ -215,6 +243,23 @@ function approvalAllowCommand(store, request, idempotencyKey) {
 function approvalDenyCommand(store, request, idempotencyKey) {
   if (request.kind === "screen_time") return null;
   return store.queueCommand(request.deviceId, "app.terminate", { pid: request.pid, processName: request.appName, requestId: request.id }, { idempotencyKey });
+}
+
+// Other parents of the family refresh their rule list when one parent changes it. Data-only
+// message: the client re-reads /policies/current, so the payload carries no rule contents.
+async function notifyFamilyPolicyChanged(fcm, store, familyPolicy, actorParentId) {
+  const parentIds = store.familyParentIds(familyPolicy.familyId).filter((id) => id !== actorParentId);
+  if (!parentIds.length) return { sent: 0, skipped: 0, parents: 0 };
+  try {
+    const result = await fcm.sendToDeviceIds(parentIds, {
+      type: "cpsm_policy_changed",
+      family_id: familyPolicy.familyId,
+      policy_version: String(familyPolicy.version)
+    });
+    return { sent: Number(result.sent || 0), skipped: Number(result.skipped || 0), failed: Number(result.failed || 0), parents: parentIds.length };
+  } catch (error) {
+    return { sent: 0, failed: parentIds.length, parents: parentIds.length };
+  }
 }
 
 // Parent-facing summary. Presence is derived from the last authenticated sync so a child
@@ -535,6 +580,42 @@ async function main() {
         return;
       }
 
+      const childAppInstallRequests = pathname.match(/^\/api\/devices\/([^/]+)\/app-install-requests$/);
+      if (childAppInstallRequests && ["GET", "POST"].includes(req.method)) {
+        const deviceId = normalizeDeviceId(childAppInstallRequests[1]);
+        auth.requireDevice(req, deviceId, requestPath, body.raw);
+        if (req.method === "POST") {
+          const request = store.createAppInstallRequest({
+            deviceId,
+            packageName: value.package_name,
+            displayName: value.display_name,
+            requestNote: value.request_note
+          });
+          sendJson(res, 201, {
+            ok: true,
+            request: store.publicAppInstallRequest(request),
+            requires_user_installer_confirmation: true
+          });
+          return;
+        }
+        const status = requestUrl.searchParams.get("status") || "pending";
+        const requests = store.listAppInstallRequests({ deviceId, status });
+        sendJson(res, 200, { requests: requests.map((request) => store.publicAppInstallRequest(request)) });
+        return;
+      }
+
+      const childAppInstallCancel = pathname.match(/^\/api\/devices\/([^/]+)\/app-install-requests\/([^/]+)\/cancel$/);
+      if (req.method === "POST" && childAppInstallCancel) {
+        const deviceId = normalizeDeviceId(childAppInstallCancel[1]);
+        auth.requireDevice(req, deviceId, requestPath, body.raw);
+        const request = store.cancelAppInstallRequest({
+          deviceId,
+          requestId: decodeURIComponent(childAppInstallCancel[2])
+        });
+        sendJson(res, 200, { ok: true, request: store.publicAppInstallRequest(request) });
+        return;
+      }
+
       const childConsent = pathname.match(/^\/api\/devices\/([^/]+)\/consent-requests\/([^/]+)\/decision$/);
       if (req.method === "POST" && childConsent) {
         const deviceId = normalizeDeviceId(childConsent[1]);
@@ -551,9 +632,15 @@ async function main() {
       }
 
       const childLocationConsent = pathname.match(/^\/api\/devices\/([^/]+)\/location-consent$/);
-      if (req.method === "POST" && childLocationConsent) {
+      if (childLocationConsent && ["GET", "POST"].includes(req.method)) {
         const deviceId = normalizeDeviceId(childLocationConsent[1]);
         auth.requireDevice(req, deviceId, requestPath, body.raw);
+        if (req.method === "GET") {
+          const familyId = store.familyIdForDevice(deviceId);
+          if (!familyId) throw new StoreError("device_not_found", 404);
+          sendJson(res, 200, { ok: true, location_consent: store.getLocationConsent(deviceId, familyId) });
+          return;
+        }
         const input = sanitizeLocationConsent(value);
         const prior = store.state.locationConsents[deviceId];
         const familyId = store.familyIdForDevice(deviceId) || (prior && prior.familyId) || "";
@@ -585,9 +672,19 @@ async function main() {
         auth.requireDevice(req, deviceId, requestPath, body.raw);
         const sample = sanitizeLocationSample(value);
         const result = store.recordLocationSample({ deviceId, sample });
+        let parentFcm = { sent: 0, skipped: 0, failed: 0 };
+        if (!result.duplicate) {
+          parentFcm = await fcm.sendToDeviceIds(
+            store.familyParentIds(result.sample.familyId),
+            { type: "cpsm_location_updated" },
+            undefined
+          );
+        }
         sendJson(res, result.duplicate ? 200 : 201, {
           ok: true, duplicate: result.duplicate, sample_id: result.sample.sampleId,
-          captured_at: result.sample.capturedAt, transitions: result.transitions
+          captured_at: result.sample.capturedAt, capture_type: result.sample.captureType,
+          transitions: result.transitions,
+          parent_refresh_fcm: { sent: Number(parentFcm.sent || 0), skipped: Number(parentFcm.skipped || 0), failed: Number(parentFcm.failed || 0) }
         });
         return;
       }
@@ -889,6 +986,37 @@ async function main() {
 
       if (pathname.startsWith("/api/parent/")) auth.requireParent(req);
 
+      const childMissionRewards = pathname.match(/^\/api\/devices\/([^/]+)\/mission-rewards$/);
+      if (childMissionRewards && req.method === "GET") {
+        const deviceId = normalizeDeviceId(childMissionRewards[1]);
+        auth.requireDevice(req, deviceId, requestPath, body.raw);
+        const limit = Number(requestUrl.searchParams.get("limit") || 50);
+        const rewards = store.listMissionRewardsForChild({ deviceId, limit });
+        sendJson(res, 200, { ok: true, rewards });
+        return;
+      }
+      const childMissions = pathname.match(/^\/api\/devices\/([^/]+)\/missions$/);
+      if (childMissions && req.method === "GET") {
+        const deviceId = normalizeDeviceId(childMissions[1]);
+        auth.requireDevice(req, deviceId, requestPath, body.raw);
+        const status = requestUrl.searchParams.get("status") || "all";
+        sendJson(res, 200, { ok: true, missions: store.listMissionsForChild({ deviceId, status }) });
+        return;
+      }
+      const childMissionSubmission = pathname.match(/^\/api\/devices\/([^/]+)\/missions\/([^/]+)\/submissions$/);
+      if (childMissionSubmission && req.method === "POST") {
+        const deviceId = normalizeDeviceId(childMissionSubmission[1]);
+        auth.requireDevice(req, deviceId, requestPath, body.raw);
+        validateMissionBody(value, ["message"]);
+        const result = store.submitMission({
+          deviceId, missionId: decodeURIComponent(childMissionSubmission[2]), message: value.message
+        });
+        sendJson(res, 201, {
+          ok: true, submission: store.publicMissionSubmission(result.submission), mission: result.mission
+        });
+        return;
+      }
+
       if (req.method === "GET" && pathname === "/api/parent/updates/manifest") {
         const product = String(requestUrl.searchParams.get("product") || "cpsm-p");
         if (product !== "cpsm-p") throw new ArtifactError("artifact_product_not_for_parent", 403);
@@ -927,6 +1055,72 @@ async function main() {
         if (!store.state.devices[deviceId] || !canAccessDevice(deviceId)) throw new StoreError("device_not_found", 404);
       };
       const familyScope = parentSession && parentSession.family_id ? parentSession.family_id : null;
+      if (req.method === "POST" && pathname === "/api/parent/missions") {
+        const session = requireParentProfile();
+        validateMissionBody(value, ["request_id", "device_id", "title", "instructions", "bonus_minutes"]);
+        const result = store.createMission({
+          familyId: session.family_id, parentId: session.parent_id,
+          requestId: value.request_id, deviceId: value.device_id,
+          title: value.title, instructions: value.instructions, bonusMinutes: value.bonus_minutes
+        });
+        sendJson(res, result.created ? 201 : 200, { ok: true, mission: store.publicMission(result.mission) });
+        return;
+      }
+      if (req.method === "GET" && pathname === "/api/parent/missions") {
+        const session = requireParentProfile();
+        const status = requestUrl.searchParams.get("status") || "all";
+        sendJson(res, 200, {
+          ok: true, missions: store.listMissionsForParent({ familyId: session.family_id, parentId: session.parent_id, status })
+        });
+        return;
+      }
+      const parentMissionCancel = pathname.match(/^\/api\/parent\/missions\/([^/]+)\/cancel$/);
+      if (req.method === "POST" && parentMissionCancel) {
+        const session = requireParentProfile();
+        validateMissionBody(value, []);
+        const mission = store.cancelMission({
+          missionId: decodeURIComponent(parentMissionCancel[1]),
+          familyId: session.family_id, parentId: session.parent_id
+        });
+        sendJson(res, 200, { ok: true, mission });
+        return;
+      }
+      const parentMissionReview = pathname.match(/^\/api\/parent\/missions\/([^/]+)\/review$/);
+      if (req.method === "POST" && parentMissionReview) {
+        const session = requireParentProfile();
+        validateMissionBody(value, ["submission_id", "decision", "note"]);
+        const result = store.reviewMission({
+          missionId: decodeURIComponent(parentMissionReview[1]),
+          submissionId: value.submission_id, familyId: session.family_id, parentId: session.parent_id,
+          decision: value.decision, note: value.note
+        });
+        sendJson(res, 200, { ok: true, ...result });
+        return;
+      }
+      if (req.method === "GET" && pathname === "/api/parent/app-install-requests") {
+        const session = requireParentProfile();
+        const status = requestUrl.searchParams.get("status") || "pending";
+        const requests = store.listAppInstallRequests({ familyId: session.family_id, status });
+        sendJson(res, 200, { requests: requests.map((request) => store.publicAppInstallRequest(request)) });
+        return;
+      }
+      const parentAppInstallDecision = pathname.match(/^\/api\/parent\/app-install-requests\/([^/]+)\/decision$/);
+      if (req.method === "POST" && parentAppInstallDecision) {
+        const session = requireParentProfile();
+        const request = store.decideAppInstallRequest({
+          requestId: decodeURIComponent(parentAppInstallDecision[1]),
+          familyId: session.family_id,
+          parentId: session.parent_id,
+          decision: value.decision,
+          decisionNote: value.decision_note
+        });
+        sendJson(res, 200, {
+          ok: true,
+          request: store.publicAppInstallRequest(request),
+          requires_user_installer_confirmation: true
+        });
+        return;
+      }
       const geofenceRoute = pathname.match(/^\/api\/parent\/geofences(?:\/([^/]+))?$/);
       if (geofenceRoute && req.method === "GET" && !geofenceRoute[1]) {
         const session = requireParentProfile();
@@ -991,7 +1185,8 @@ async function main() {
         }, undefined, { priority: "high" });
         sendJson(res, created.reused ? 200 : 202, {
           ok: true, request: created.request, command_id: created.command.id,
-          reused: created.reused, fcm: { sent: Number(fcmResult.sent || 0), skipped: Number(fcmResult.skipped || 0), failed: Number(fcmResult.failed || 0) }
+          reused: created.reused,
+          fcm: { sent: Number(fcmResult.sent || 0), skipped: Number(fcmResult.skipped || 0), failed: Number(fcmResult.failed || 0) }
         });
         return;
       }
@@ -1005,7 +1200,9 @@ async function main() {
         const timeline = store.listLocationTimeline(deviceId, session.family_id, limit);
         sendJson(res, 200, {
           ok: true, device_id: deviceId, location_consent: store.getLocationConsent(deviceId, session.family_id),
-          retention_days: timeline.retentionDays, samples: timeline.samples, transitions: timeline.transitions, requests: timeline.requests
+          retention_days: timeline.retentionDays,
+          sample_interval_ms: timeline.sampleIntervalMs,
+          samples: timeline.samples, transitions: timeline.transitions, requests: timeline.requests
         });
         return;
       }
@@ -1171,6 +1368,7 @@ async function main() {
         const rules = sanitizeRules(value.rules || []);
         const screenTime = sanitizeScreenTime(value.screenTime !== undefined ? value.screenTime : value.screen_time);
         if (parentSession && !(parentSession.family_id && parentSession.parent_id)) throw new StoreError("parent_session_profile_required", 403);
+        validatePolicyRuleTargets(store, parentSession, rules);
         const familyPolicy = parentSession
           ? store.replaceFamilyPolicyRules(parentSession.family_id, rules, screenTime) : null;
         if (!familyPolicy) store.replacePolicyRules(rules);
@@ -1179,8 +1377,9 @@ async function main() {
         for (const deviceId of refreshTargets) {
           store.queueCommand(deviceId, "policy.refresh", {}, { idempotencyKey: `policy-${policyRefreshVersion}-${deviceId}` });
         }
+        const notified = familyPolicy ? await notifyFamilyPolicyChanged(fcm, store, familyPolicy, parentSession.parent_id) : { sent: 0 };
         const policy = familyPolicy && familyPolicy.policy ? familyPolicy.policy : store.state.policy;
-        sendJson(res, 200, { ok: true, policy: { ...policy, family_id: familyPolicy ? familyPolicy.familyId : null, publicKey: publicKeyPem(store) } });
+        sendJson(res, 200, { ok: true, policy: { ...policy, family_id: familyPolicy ? familyPolicy.familyId : null, publicKey: publicKeyPem(store) }, parents_notified: notified });
         return;
       }
 
@@ -1201,6 +1400,23 @@ async function main() {
         sendJson(res, 200, { ok: true, request, command });
         return;
       }
+      if (req.method === "POST" && pathname === "/api/parent/family-invites") {
+        const session = requireParentProfile();
+        const invite = store.createFamilyInvite({ familyId: session.family_id, parentId: session.parent_id });
+        store.audit("parent", session.parent_id, "family_invite_created", req.headers["x-request-id"] || null, { inviteId: invite.inviteId, familyId: invite.familyId });
+        sendJson(res, 201, { ok: true, invite_id: invite.inviteId, invite_code: invite.inviteCode, expires_at: invite.expiresAt });
+        return;
+      }
+      const familyInviteAccept = pathname.match(/^\/api\/parent\/family-invites\/([^/]+)\/accept$/);
+      if (req.method === "POST" && familyInviteAccept) {
+        const session = requireParentProfile();
+        const joined = store.acceptFamilyInvite({ inviteId: decodeURIComponent(familyInviteAccept[1]), inviteCode: value.invite_code, parentId: session.parent_id });
+        store.audit("parent", session.parent_id, "family_invite_accepted", req.headers["x-request-id"] || null, { familyId: joined.familyId, previousFamilyId: joined.previousFamilyId });
+        await fcm.sendToDeviceIds([joined.issuerParentId], { type: "cpsm_family_member_joined", family_id: joined.familyId },
+          { title: "CPSM 공동 보호자", body: "다른 보호자가 가족에 참여했습니다." }).catch(() => null);
+        sendJson(res, 200, { ok: true, family_id: joined.familyId, reenroll_required: true });
+        return;
+      }
       if (req.method === "GET" && pathname === "/api/parent/blocked-apps") {
         const familyPolicy = familyScope ? store.getFamilyPolicy(familyScope) : null;
         sendJson(res, 200, { blockedApps: parentSession ? ((familyPolicy && familyPolicy.policy.rules) || []) : store.state.policy.rules });
@@ -1209,13 +1425,15 @@ async function main() {
       if (req.method === "POST" && pathname === "/api/parent/blocked-apps" && parentSession) {
         const session = requireParentProfile();
         const rule = sanitizeRules([{ ...value, id: value.id || crypto.randomUUID() }])[0];
+        validatePolicyRuleTargets(store, parentSession, [rule]);
         const current = store.getFamilyPolicy(session.family_id);
         const rules = ((current && current.policy.rules) || []).filter((item) => item.id !== rule.id).concat([rule]);
         const familyPolicy = store.replaceFamilyPolicyRules(session.family_id, rules);
         for (const deviceId of store.familyDeviceIds(session.family_id)) {
           store.queueCommand(deviceId, "policy.refresh", {}, { idempotencyKey: `policy-${familyPolicy.version}-${deviceId}` });
         }
-        sendJson(res, 200, { ok: true, rule });
+        const notified = await notifyFamilyPolicyChanged(fcm, store, familyPolicy, session.parent_id);
+        sendJson(res, 200, { ok: true, rule, parents_notified: notified });
         return;
       }
       if (req.method === "GET" && pathname === "/api/parent/devices") {
@@ -1261,7 +1479,12 @@ async function main() {
       const status = known ? error.status : 500;
       const code = known ? error.code : "internal_error";
       if (status >= 500) log.error("request.failed", { code });
-      sendJson(res, status, { ok: false, error: code });
+      const payload = { ok: false, error: code };
+      if (Number.isFinite(error.retryAfterMs) && error.retryAfterMs >= 0) {
+        payload.retry_after_ms = Math.ceil(error.retryAfterMs);
+        res.setHeader("retry-after", String(Math.ceil(error.retryAfterMs / 1000)));
+      }
+      sendJson(res, status, payload);
     }
   });
 

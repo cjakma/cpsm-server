@@ -37,6 +37,7 @@ try {
   assert.equal(store.storageMode(), "sqlite", "test requires SQLite persistence");
   assert.equal(store.locationRetentionDays, 30, "default location retention is 30 days");
   assert.equal(store.locationMinBatteryPercent, 30, "default location battery threshold is 30 percent");
+  assert.equal(store.locationSampleIntervalMs, 60 * 60 * 1000, "default scheduled sampling interval is 60 minutes");
   const timestamp = new Date().toISOString();
   store.state.families["family-test"] = {
     familyId: "family-test", name: "test", status: "active", createdAt: timestamp, updatedAt: timestamp
@@ -67,7 +68,7 @@ try {
     const pending = store.createLocationRequest({ deviceId, familyId: "family-test", parentId: "parent-test" });
     assert.equal(pending.command.payload.min_battery_percent, 30, "location request carries 30% default battery threshold");
     assert.equal(pending.command.payload.charging_override, true, "charging bypasses the low-battery gate");
-    const sampleValue = { sampleId: `sample-${suffix}`, requestId: pending.request.requestId, capturedAt: new Date(capturedAt).toISOString(), latitude: lat, longitude: 127, accuracyMeters: 10, provider: "gps", batteryPercent: 80, charging: false };
+    const sampleValue = { sampleId: `sample-${suffix}`, requestId: pending.request.requestId, captureType: "parent_request", capturedAt: new Date(capturedAt).toISOString(), latitude: lat, longitude: 127, accuracyMeters: 10, provider: "gps", batteryPercent: 80, charging: false };
     return store.recordLocationSample({ deviceId, sample: sampleValue });
   };
   const sampleBase = Date.now();
@@ -77,6 +78,16 @@ try {
   const enter = addSample(37.5, Date.now() + 2000, "inside-2");
   assert.equal(enter.transitions[0].type, "enter", "inside sample creates enter transition");
   assert.equal(store.recordLocationSample({ deviceId, sample: { ...enter.sample, receivedAt: undefined } }).duplicate, true, "sample retry is idempotent");
+  const scheduled = sanitizeLocationSample({ sample_id: "sample-periodic", capture_type: "scheduled", captured_at: new Date().toISOString(), latitude: 37.5, longitude: 127, accuracy_m: 10, provider: "gps", battery_pct: 80, charging: false });
+  const scheduledResult = store.recordLocationSample({ deviceId, sample: scheduled });
+  assert.equal(scheduledResult.sample.captureType, "scheduled", "periodic sample persists as a scheduled capture, not a request result");
+  assert.equal(scheduledResult.sample.requestId, "", "periodic sample does not invent a parent request ID");
+  assert.equal(store.recordLocationSample({ deviceId, sample: scheduled }).duplicate, true, "periodic upload retry is idempotent");
+  const nextRequest = store.createLocationRequest({ deviceId, familyId: "family-test", parentId: "parent-test" });
+  const duplicateActiveRequest = store.createLocationRequest({ deviceId, familyId: "family-test", parentId: "parent-test" });
+  assert.equal(nextRequest.reused, false, "parent can request an immediate refresh after a terminal capture");
+  assert.equal(duplicateActiveRequest.reused, true, "only an existing active request is reused");
+  assert.equal(duplicateActiveRequest.request.requestId, nextRequest.request.requestId, "active request retry preserves identity");
   store.db.close();
   store = new Store(dataDir);
   const staleAt = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString();
@@ -99,7 +110,8 @@ try {
   assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE id = ?").get("stale-location-audit").count, 0);
   store.save();
   const timeline = store.listLocationTimeline(deviceId, "family-test", 10);
-  assert.equal(timeline.samples.length, 3, "location sample history survives reload");
+  assert.equal(timeline.samples.length, 4, "location sample history survives reload");
+  assert.equal(timeline.sampleIntervalMs, 60 * 60 * 1000, "timeline exposes periodic sampling cadence, not request cooldown");
   assert.deepEqual(timeline.transitions.map((item) => item.type).sort(), ["enter", "exit"], "transition history survives reload");
   assert.equal(store.getLocationConsent(deviceId, "family-test").childConsented, true, "location consent survives reload");
   store.setLocationConsent({ deviceId, familyId: "family-test", actorType: "child", consent: false, actorId: deviceId });

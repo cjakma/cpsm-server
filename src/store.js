@@ -60,6 +60,8 @@ const ERROR_SEVERITIES = new Set(["info", "warning", "error", "critical"]);
 const ERROR_STATUSES = new Set(["new", "triaged", "in_progress", "resolved", "wont_fix", "regressed"]);
 const CHANGE_TYPES = new Set(["added", "modified", "fixed", "removed", "security", "compatibility"]);
 const ERROR_LINK_RELATIONS = new Set(["introduced", "observed", "fixed", "regressed", "not_reproduced"]);
+const APP_INSTALL_REQUEST_TTL_MS = 24 * 60 * 60 * 1000;
+const MISSION_REWARD_COMMAND_TTL_MS = 60 * 60 * 1000;
 
 function redactText(value) {
   return String(value == null ? "" : value)
@@ -110,6 +112,13 @@ function defaultState() {
     events: [],
     commands: [],
     approvalRequests: [],
+    appInstallRequests: [],
+    missions: [],
+    missionSubmissions: [],
+    missionReviews: [],
+    missionRewards: [],
+    missionCreateRequests: [],
+    auditLog: [],
     blockedApps: [],
     families: {},
     parentProfiles: {},
@@ -155,6 +164,13 @@ function normalizeState(input) {
     events: Array.isArray(state.events) ? state.events : [],
     commands: Array.isArray(state.commands) ? state.commands : [],
     approvalRequests: Array.isArray(state.approvalRequests) ? state.approvalRequests : [],
+    appInstallRequests: Array.isArray(state.appInstallRequests) ? state.appInstallRequests : [],
+    missions: Array.isArray(state.missions) ? state.missions : [],
+    missionSubmissions: Array.isArray(state.missionSubmissions) ? state.missionSubmissions : [],
+    missionReviews: Array.isArray(state.missionReviews) ? state.missionReviews : [],
+    missionRewards: Array.isArray(state.missionRewards) ? state.missionRewards : [],
+    missionCreateRequests: Array.isArray(state.missionCreateRequests) ? state.missionCreateRequests : [],
+    auditLog: Array.isArray(state.auditLog) ? state.auditLog : [],
     parentTokens: Array.isArray(state.parentTokens) ? state.parentTokens.filter(Boolean) : [],
     parentSessions: Array.isArray(state.parentSessions) ? state.parentSessions : [],
     pairingSessions: state.pairingSessions && typeof state.pairingSessions === "object" && !Array.isArray(state.pairingSessions) ? state.pairingSessions : {},
@@ -246,6 +262,9 @@ class Store {
     this.locationRetentionDays = Number.isInteger(retentionDays) && retentionDays >= 1 && retentionDays <= 90 ? retentionDays : 30;
     const minBatteryPercent = Number(options.locationMinBatteryPercent ?? process.env.CPSM_LOCATION_MIN_BATTERY_PERCENT ?? 30);
     this.locationMinBatteryPercent = Number.isInteger(minBatteryPercent) && minBatteryPercent >= 0 && minBatteryPercent <= 100 ? minBatteryPercent : 30;
+    const sampleIntervalMs = Number(options.locationSampleIntervalMs ?? process.env.CPSM_LOCATION_SAMPLE_INTERVAL_MS ?? 60 * 60 * 1000);
+    this.locationSampleIntervalMs = Number.isInteger(sampleIntervalMs) && sampleIntervalMs >= 15 * 60 * 1000 && sampleIntervalMs <= 24 * 60 * 60 * 1000
+      ? sampleIntervalMs : 60 * 60 * 1000;
     this.sqlite = Boolean(DatabaseSync);
     this.db = null;
 
@@ -338,6 +357,90 @@ class Store {
         created_at TEXT NOT NULL,
         decided_at TEXT
       );
+      CREATE TABLE IF NOT EXISTS app_install_requests (
+        request_id TEXT PRIMARY KEY,
+        device_id TEXT NOT NULL,
+        family_id TEXT NOT NULL,
+        child_name TEXT NOT NULL,
+        package_name TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        request_note TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'denied', 'cancelled', 'expired')),
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        decided_at TEXT,
+        decision_note TEXT
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS app_install_requests_pending_package
+        ON app_install_requests(device_id, package_name) WHERE status = 'pending';
+      CREATE INDEX IF NOT EXISTS app_install_requests_family_status
+        ON app_install_requests(family_id, status, created_at);
+      CREATE INDEX IF NOT EXISTS app_install_requests_expiry
+        ON app_install_requests(status, expires_at);
+      CREATE TABLE IF NOT EXISTS missions (
+        mission_id TEXT PRIMARY KEY,
+        family_id TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        created_by_parent_id TEXT NOT NULL,
+        title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 80),
+        instructions TEXT NOT NULL CHECK (length(instructions) BETWEEN 1 AND 1000),
+        bonus_minutes INTEGER NOT NULL CHECK (bonus_minutes BETWEEN 0 AND 240),
+        status TEXT NOT NULL CHECK (status IN ('active', 'pending_review', 'completed', 'cancelled')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        cancelled_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS missions_family_status_created
+        ON missions(family_id, status, created_at);
+      CREATE INDEX IF NOT EXISTS missions_device_status_created
+        ON missions(device_id, status, created_at);
+      CREATE TABLE IF NOT EXISTS mission_submissions (
+        submission_id TEXT PRIMARY KEY,
+        mission_id TEXT NOT NULL,
+        family_id TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        message TEXT NOT NULL CHECK (length(message) BETWEEN 1 AND 2000),
+        status TEXT NOT NULL CHECK (status IN ('pending_review', 'approved', 'rejected')),
+        submitted_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS mission_submissions_latest
+        ON mission_submissions(mission_id, submitted_at DESC, submission_id DESC);
+      CREATE TABLE IF NOT EXISTS mission_reviews (
+        review_id TEXT PRIMARY KEY,
+        submission_id TEXT NOT NULL UNIQUE,
+        mission_id TEXT NOT NULL,
+        family_id TEXT NOT NULL,
+        parent_id TEXT NOT NULL,
+        decision TEXT NOT NULL CHECK (decision IN ('approve', 'reject')),
+        note TEXT,
+        reviewed_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS mission_reviews_family_time
+        ON mission_reviews(family_id, reviewed_at);
+      CREATE TABLE IF NOT EXISTS mission_rewards (
+        reward_id TEXT PRIMARY KEY,
+        submission_id TEXT NOT NULL UNIQUE,
+        mission_id TEXT NOT NULL,
+        family_id TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        bonus_minutes INTEGER NOT NULL CHECK (bonus_minutes BETWEEN 0 AND 240),
+        command_id TEXT,
+        granted_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS mission_rewards_family_time
+        ON mission_rewards(family_id, granted_at);
+      CREATE TABLE IF NOT EXISTS mission_create_requests (
+        family_id TEXT NOT NULL,
+        parent_id TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        payload_fingerprint TEXT NOT NULL,
+        mission_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (family_id, parent_id, request_id),
+        UNIQUE (mission_id)
+      );
+      CREATE INDEX IF NOT EXISTS mission_create_requests_mission
+        ON mission_create_requests(mission_id);
       CREATE TABLE IF NOT EXISTS policies (
         policy_id TEXT PRIMARY KEY,
         version INTEGER NOT NULL,
@@ -461,6 +564,7 @@ class Store {
         device_id TEXT NOT NULL,
         sample_id TEXT NOT NULL,
         request_id TEXT NOT NULL,
+        capture_type TEXT NOT NULL DEFAULT 'parent_request',
         family_id TEXT NOT NULL,
         captured_at TEXT NOT NULL,
         received_at TEXT NOT NULL,
@@ -670,7 +774,8 @@ class Store {
       "ALTER TABLE pairing_sessions ADD COLUMN mapping_id TEXT",
       "ALTER TABLE pairing_sessions ADD COLUMN confirmed_at TEXT",
       "ALTER TABLE approval_requests ADD COLUMN kind TEXT NOT NULL DEFAULT 'app_launch'",
-      "ALTER TABLE approval_requests ADD COLUMN requested_minutes INTEGER"
+      "ALTER TABLE approval_requests ADD COLUMN requested_minutes INTEGER",
+      "ALTER TABLE location_samples ADD COLUMN capture_type TEXT NOT NULL DEFAULT 'parent_request'"
     ]) {
       try {
         this.db.exec(statement);
@@ -835,7 +940,7 @@ class Store {
       createdAt: row.created_at, expiresAt: row.expires_at, updatedAt: row.updated_at
     }]));
     this.state.locationSamples = Object.fromEntries(this.db.prepare("SELECT * FROM location_samples ORDER BY captured_at").all().map((row) => [`${row.device_id}:${row.sample_id}`, {
-      deviceId: row.device_id, sampleId: row.sample_id, requestId: row.request_id, familyId: row.family_id,
+      deviceId: row.device_id, sampleId: row.sample_id, requestId: row.request_id || "", captureType: row.capture_type || "parent_request", familyId: row.family_id,
       capturedAt: row.captured_at, receivedAt: row.received_at, latitude: Number(row.latitude), longitude: Number(row.longitude),
       accuracyMeters: Number(row.accuracy_m), provider: row.provider, batteryPercent: Number(row.battery_pct), charging: Boolean(row.charging)
     }]));
@@ -860,6 +965,40 @@ class Store {
       recipientId: row.recipient_id, status: row.status, createdAt: row.created_at,
       expiresAt: row.expires_at, respondedAt: row.responded_at || null, response: row.response || null
     }]));
+    this.state.appInstallRequests = this.db.prepare("SELECT * FROM app_install_requests ORDER BY created_at, request_id").all().map((row) => ({
+      requestId: row.request_id, deviceId: row.device_id, familyId: row.family_id, childName: row.child_name,
+      packageName: row.package_name, displayName: row.display_name, requestNote: row.request_note,
+      status: row.status, createdAt: row.created_at, expiresAt: row.expires_at,
+      decidedAt: row.decided_at || null, decisionNote: row.decision_note ?? null
+    }));
+    this.state.missions = this.db.prepare("SELECT * FROM missions ORDER BY created_at, mission_id").all().map((row) => ({
+      missionId: row.mission_id, familyId: row.family_id, deviceId: row.device_id,
+      createdByParentId: row.created_by_parent_id, title: row.title, instructions: row.instructions,
+      bonusMinutes: Number(row.bonus_minutes), status: row.status, createdAt: row.created_at,
+      updatedAt: row.updated_at, cancelledAt: row.cancelled_at || null
+    }));
+    this.state.missionSubmissions = this.db.prepare("SELECT * FROM mission_submissions ORDER BY submitted_at, submission_id").all().map((row) => ({
+      submissionId: row.submission_id, missionId: row.mission_id, familyId: row.family_id,
+      deviceId: row.device_id, message: row.message, status: row.status, submittedAt: row.submitted_at
+    }));
+    this.state.missionReviews = this.db.prepare("SELECT * FROM mission_reviews ORDER BY reviewed_at, review_id").all().map((row) => ({
+      reviewId: row.review_id, submissionId: row.submission_id, missionId: row.mission_id,
+      familyId: row.family_id, parentId: row.parent_id, decision: row.decision,
+      note: row.note || null, reviewedAt: row.reviewed_at
+    }));
+    this.state.missionRewards = this.db.prepare("SELECT * FROM mission_rewards ORDER BY granted_at, reward_id").all().map((row) => ({
+      rewardId: row.reward_id, submissionId: row.submission_id, missionId: row.mission_id,
+      familyId: row.family_id, deviceId: row.device_id, bonusMinutes: Number(row.bonus_minutes),
+      commandId: row.command_id || null, grantedAt: row.granted_at
+    }));
+    this.state.missionCreateRequests = this.db.prepare("SELECT * FROM mission_create_requests ORDER BY created_at, request_id").all().map((row) => ({
+      familyId: row.family_id, parentId: row.parent_id, requestId: row.request_id,
+      payloadFingerprint: row.payload_fingerprint, missionId: row.mission_id, createdAt: row.created_at
+    }));
+    this.state.auditLog = this.db.prepare("SELECT * FROM audit_log ORDER BY created_at DESC, rowid DESC LIMIT 10000").all().reverse().map((row) => ({
+      id: row.id, actorType: row.actor_type, actorId: row.actor_id || null, action: row.action,
+      requestId: row.request_id || null, metadata: parseJson(row.metadata_json, {}), createdAt: row.created_at
+    }));
     this.state.notificationKeys = Object.fromEntries(this.db.prepare("SELECT * FROM device_notification_keys ORDER BY created_at").all().map((row) => [row.notification_key_id, {
       notificationKeyId: row.notification_key_id, deviceId: row.device_id, provider: row.provider,
       token: row.token, status: row.status, createdAt: row.created_at, updatedAt: row.updated_at
@@ -1052,10 +1191,10 @@ class Store {
     }
   }
 
-  saveSqlite() {
+  saveSqlite(auditEntries = []) {
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.db.exec("DELETE FROM error_app_version_links; DELETE FROM device_error_occurrences; DELETE FROM device_errors; DELETE FROM app_version_changes; DELETE FROM devices; DELETE FROM events; DELETE FROM commands; DELETE FROM approval_requests; DELETE FROM policies; DELETE FROM parent_tokens; DELETE FROM parent_sessions; DELETE FROM pairing_sessions; DELETE FROM location_transitions; DELETE FROM geofence_states; DELETE FROM location_samples; DELETE FROM location_requests; DELETE FROM location_consents; DELETE FROM geofences; DELETE FROM families; DELETE FROM parent_profiles; DELETE FROM child_profiles; DELETE FROM family_members; DELETE FROM parent_child_mappings; DELETE FROM consent_requests; DELETE FROM device_notification_keys; DELETE FROM app_versions; DELETE FROM family_policies; DELETE FROM device_policy_assignments; DELETE FROM policy_sync_receipts;");
+      this.db.exec("DELETE FROM error_app_version_links; DELETE FROM device_error_occurrences; DELETE FROM device_errors; DELETE FROM app_version_changes; DELETE FROM devices; DELETE FROM events; DELETE FROM commands; DELETE FROM approval_requests; DELETE FROM app_install_requests; DELETE FROM mission_create_requests; DELETE FROM missions; DELETE FROM mission_submissions; DELETE FROM mission_reviews; DELETE FROM mission_rewards; DELETE FROM policies; DELETE FROM parent_tokens; DELETE FROM parent_sessions; DELETE FROM pairing_sessions; DELETE FROM location_transitions; DELETE FROM geofence_states; DELETE FROM location_samples; DELETE FROM location_requests; DELETE FROM location_consents; DELETE FROM geofences; DELETE FROM families; DELETE FROM parent_profiles; DELETE FROM child_profiles; DELETE FROM family_members; DELETE FROM parent_child_mappings; DELETE FROM consent_requests; DELETE FROM device_notification_keys; DELETE FROM app_versions; DELETE FROM family_policies; DELETE FROM device_policy_assignments; DELETE FROM policy_sync_receipts;");
       const deviceInsert = this.db.prepare("INSERT INTO devices (device_id, child_name, device_name, platform, status, current_app, local_policy_version, last_event_seq, last_seen_at, hmac_secret, public_key, registration_status, registered_at, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
       for (const [deviceId, device] of Object.entries(this.state.devices)) {
         deviceInsert.run(deviceId, device.childName || "자녀", device.deviceName || deviceId, device.platform || "windows", device.status || "running", device.currentApp || "", Number(device.localPolicyVersion || 0), Number(device.lastEventSeq || 0), device.lastSeenAt || nowIso(), this._deviceSecrets.get(deviceId) || null, device.publicKey || null, device.registrationStatus || "unregistered", device.registeredAt || null, JSON.stringify(device.metadata || {}), device.createdAt || device.lastSeenAt || nowIso());
@@ -1072,6 +1211,35 @@ class Store {
       for (const request of this.state.approvalRequests) {
         approvalInsert.run(request.id, request.deviceId, request.childName || "자녀", request.deviceName || request.deviceId, request.appName || "unknown", request.executablePath || "", request.pid == null ? null : Number(request.pid), request.eventId || "", request.status || "pending", request.decision || null, request.createdAt || nowIso(), request.decidedAt || null, request.kind || "app_launch", request.requestedMinutes == null ? null : Number(request.requestedMinutes));
       }
+      const appInstallInsert = this.db.prepare("INSERT INTO app_install_requests (request_id, device_id, family_id, child_name, package_name, display_name, request_note, status, created_at, expires_at, decided_at, decision_note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const request of this.state.appInstallRequests || []) {
+        appInstallInsert.run(request.requestId, request.deviceId, request.familyId, request.childName || "자녀", request.packageName, request.displayName, request.requestNote, request.status || "pending", request.createdAt || nowIso(), request.expiresAt, request.decidedAt || null, request.decisionNote || null);
+      }
+      const missionInsert = this.db.prepare("INSERT INTO missions (mission_id, family_id, device_id, created_by_parent_id, title, instructions, bonus_minutes, status, created_at, updated_at, cancelled_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const mission of this.state.missions || []) missionInsert.run(
+        mission.missionId, mission.familyId, mission.deviceId, mission.createdByParentId, mission.title,
+        mission.instructions, Number(mission.bonusMinutes), mission.status, mission.createdAt,
+        mission.updatedAt, mission.cancelledAt || null
+      );
+      const submissionInsert = this.db.prepare("INSERT INTO mission_submissions (submission_id, mission_id, family_id, device_id, message, status, submitted_at) VALUES (?, ?, ?, ?, ?, ?, ?)");
+      for (const submission of this.state.missionSubmissions || []) submissionInsert.run(
+        submission.submissionId, submission.missionId, submission.familyId, submission.deviceId,
+        submission.message, submission.status, submission.submittedAt
+      );
+      const reviewInsert = this.db.prepare("INSERT INTO mission_reviews (review_id, submission_id, mission_id, family_id, parent_id, decision, note, reviewed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const review of this.state.missionReviews || []) reviewInsert.run(
+        review.reviewId, review.submissionId, review.missionId, review.familyId, review.parentId,
+        review.decision, review.note || null, review.reviewedAt
+      );
+      const rewardInsert = this.db.prepare("INSERT INTO mission_rewards (reward_id, submission_id, mission_id, family_id, device_id, bonus_minutes, command_id, granted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const reward of this.state.missionRewards || []) rewardInsert.run(
+        reward.rewardId, reward.submissionId, reward.missionId, reward.familyId, reward.deviceId,
+        Number(reward.bonusMinutes), reward.commandId || null, reward.grantedAt
+      );
+      const missionCreateRequestInsert = this.db.prepare("INSERT INTO mission_create_requests (family_id, parent_id, request_id, payload_fingerprint, mission_id, created_at) VALUES (?, ?, ?, ?, ?, ?)");
+      for (const request of this.state.missionCreateRequests || []) missionCreateRequestInsert.run(
+        request.familyId, request.parentId, request.requestId, request.payloadFingerprint, request.missionId, request.createdAt
+      );
       const policy = this.state.policy;
       this.db.prepare("INSERT INTO policies (policy_id, version, updated_at, expires_at, hash, canonical_hash, signature, key_id, rules_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(policy.policyId, Number(policy.version), policy.updatedAt, policy.expiresAt, policy.hash, policy.canonicalHash, policy.signature, policy.keyId, JSON.stringify(policy.rules));
       const tokenInsert = this.db.prepare("INSERT INTO parent_tokens (token, created_at) VALUES (?, ?)");
@@ -1102,9 +1270,9 @@ class Store {
         item.requestId, item.familyId, item.deviceId, item.parentId, item.commandId, item.status,
         item.resultCode || null, item.sampleId || null, item.createdAt, item.expiresAt, item.updatedAt || nowIso()
       );
-      const locationSampleInsert = this.db.prepare("INSERT INTO location_samples (device_id, sample_id, request_id, family_id, captured_at, received_at, latitude, longitude, accuracy_m, provider, battery_pct, charging) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+      const locationSampleInsert = this.db.prepare("INSERT INTO location_samples (device_id, sample_id, request_id, capture_type, family_id, captured_at, received_at, latitude, longitude, accuracy_m, provider, battery_pct, charging) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
       for (const item of Object.values(this.state.locationSamples || {})) locationSampleInsert.run(
-        item.deviceId, item.sampleId, item.requestId, item.familyId, item.capturedAt, item.receivedAt,
+        item.deviceId, item.sampleId, item.requestId || "", item.captureType || "parent_request", item.familyId, item.capturedAt, item.receivedAt,
         Number(item.latitude), Number(item.longitude), Number(item.accuracyMeters), item.provider,
         Number(item.batteryPercent), item.charging ? 1 : 0
       );
@@ -1146,6 +1314,11 @@ class Store {
       for (const assignment of Object.values(this.state.devicePolicyAssignments || {})) assignmentInsert.run(assignment.assignmentId, assignment.deviceId, assignment.familyId, assignment.policyId, Number(assignment.version || 0), assignment.status || "pending", assignment.assignedAt || nowIso(), assignment.appliedAt || null, assignment.rejectionReason || null);
       const receiptInsert = this.db.prepare("INSERT INTO policy_sync_receipts (receipt_id, device_id, policy_id, version, canonical_hash, signature_status, local_state, accepted, reported_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
       for (const receipt of Object.values(this.state.policySyncReceipts || {})) receiptInsert.run(receipt.receiptId, receipt.deviceId, receipt.policyId || null, Number(receipt.version || 0), receipt.canonicalHash || null, receipt.signatureStatus || "unknown", receipt.localState || "unknown", receipt.accepted ? 1 : 0, receipt.reportedAt || nowIso());
+      const auditInsert = this.db.prepare("INSERT INTO audit_log (id, actor_type, actor_id, action, request_id, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)");
+      for (const entry of auditEntries) auditInsert.run(
+        entry.id, entry.actorType, entry.actorId, entry.action, entry.requestId,
+        JSON.stringify(entry.metadata || {}), entry.createdAt
+      );
       this.db.prepare("INSERT OR REPLACE INTO storage_meta (key, value) VALUES (?, ?)").run("initialized", "1");
       this.db.exec("COMMIT");
     } catch (error) {
@@ -1206,13 +1379,22 @@ class Store {
   }
 
   audit(actorType, actorId, action, requestId, metadata = {}) {
-    const entry = {
-      id: crypto.randomUUID(), actorType, actorId: actorId || null, action, requestId: requestId || null, metadata, createdAt: nowIso()
-    };
+    const entry = this.makeAuditEntry(actorType, actorId, action, requestId, metadata);
     if (this.sqlite && this.db) {
       this.db.prepare("INSERT INTO audit_log (id, actor_type, actor_id, action, request_id, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run(entry.id, entry.actorType, entry.actorId, entry.action, entry.requestId, JSON.stringify(entry.metadata), entry.createdAt);
     }
+    this.state.auditLog = [...(this.state.auditLog || []), entry].slice(-10000);
+    if (!this.sqlite) this.save();
     return entry;
+  }
+
+  makeAuditEntry(actorType, actorId, action, requestId, metadata = {}) {
+    return {
+      id: crypto.randomUUID(), actorType, actorId: actorId || null,
+      action, requestId: requestId || null,
+      metadata: metadata && typeof metadata === "object" ? clone(metadata) : {},
+      createdAt: nowIso()
+    };
   }
 
   issueParentSession(familyId = "default", ttlMs = 3600000, parentId = null) {
@@ -1285,8 +1467,11 @@ class Store {
       metadata: metadata && typeof metadata === "object" ? clone(metadata) : {},
       status: "active", createdAt: existing ? existing.createdAt : now, updatedAt: now
     };
+    const membership = this.state.familyMembers.find((item) => item.familyId === family.familyId && item.memberType === "parent" && item.memberId === parentId);
     this.state.familyMembers = this.state.familyMembers.filter((item) => !(item.familyId === family.familyId && item.memberType === "parent" && item.memberId === parentId));
-    this.state.familyMembers.push({ familyId: family.familyId, memberType: "parent", memberId: parentId, role: "owner", status: "active", createdAt: existing ? existing.createdAt : now });
+    // Re-enrolling keeps a joined co-guardian's role; only a new family's first parent is the owner.
+    this.state.familyMembers.push({ familyId: family.familyId, memberType: "parent", memberId: parentId, role: membership ? membership.role || "owner" : "owner",
+      status: "active", createdAt: membership ? membership.createdAt : (existing ? existing.createdAt : now) });
     this.save();
     return clone(this.state.parentProfiles[parentId]);
   }
@@ -1957,6 +2142,543 @@ class Store {
     return confirmed ? confirmed.familyId : null;
   }
 
+  requireConfirmedAndroidDevice(deviceId) {
+    const device = this.state.devices[String(deviceId || "")];
+    if (!device) throw new StoreError("device_not_found", 404);
+    if (device.platform !== "android") throw new StoreError("android_device_required", 409);
+    const familyId = this.familyIdForDevice(device.deviceId);
+    if (!familyId) throw new StoreError("parent_mapping_required", 409);
+    return familyId;
+  }
+
+  expireAppInstallRequests(now = Date.now()) {
+    const expired = [];
+    for (const request of this.state.appInstallRequests || []) {
+      if (request.status === "pending" && Date.parse(request.expiresAt) <= now) {
+        request.status = "expired";
+        request.decidedAt = null;
+        request.decisionNote = null;
+        expired.push(request);
+      }
+    }
+    if (expired.length) {
+      this.save();
+      for (const request of expired) {
+        this.audit("system", null, "app_install_request_expired", request.requestId, { deviceId: request.deviceId });
+      }
+    }
+    return expired.length;
+  }
+
+  normalizeAppInstallRequestInput(input = {}) {
+    const packageName = typeof input.packageName === "string" ? input.packageName.trim() : "";
+    const displayName = typeof input.displayName === "string" ? input.displayName.trim() : "";
+    const requestNote = typeof input.requestNote === "string" ? input.requestNote.trim().replace(/\s+/g, " ") : "";
+    if (packageName.length > 255 || !/^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$/.test(packageName)) {
+      throw new StoreError("invalid_package_name", 400);
+    }
+    if (!displayName || displayName.length > 120 || /[\u0000-\u001f\u007f]/.test(displayName)) {
+      throw new StoreError("invalid_display_name", 400);
+    }
+    if (!requestNote || requestNote.length > 500 || /[\u0000-\u001f\u007f]/.test(requestNote)) {
+      throw new StoreError("invalid_request_note", 400);
+    }
+    return { packageName, displayName, requestNote };
+  }
+
+  normalizeAppInstallDecisionNote(value) {
+    if (value == null) return null;
+    if (typeof value !== "string") throw new StoreError("invalid_decision_note", 400);
+    const note = value.trim().replace(/\s+/g, " ");
+    if (note.length > 500 || /[\u0000-\u001f\u007f]/.test(note)) {
+      throw new StoreError("invalid_decision_note", 400);
+    }
+    return note || null;
+  }
+
+  createAppInstallRequest({ deviceId, packageName, displayName, requestNote }) {
+    const device = this.state.devices[String(deviceId || "")];
+    if (!device) throw new StoreError("device_not_found", 404);
+    const familyId = this.requireConfirmedAndroidDevice(device.deviceId);
+    const normalized = this.normalizeAppInstallRequestInput({ packageName, displayName, requestNote });
+    this.expireAppInstallRequests();
+    const duplicate = (this.state.appInstallRequests || []).some((request) => request.deviceId === device.deviceId
+      && request.packageName === normalized.packageName && request.status === "pending");
+    if (duplicate) throw new StoreError("app_install_request_already_pending", 409);
+    const createdAt = nowIso();
+    const request = {
+      requestId: crypto.randomUUID(),
+      deviceId: device.deviceId,
+      familyId,
+      childName: String(device.childName || "자녀").slice(0, 256),
+      ...normalized,
+      status: "pending",
+      createdAt,
+      expiresAt: new Date(Date.parse(createdAt) + APP_INSTALL_REQUEST_TTL_MS).toISOString(),
+      decidedAt: null,
+      decisionNote: null
+    };
+    this.state.appInstallRequests.push(request);
+    this.save();
+    this.audit("device", device.deviceId, "app_install_request_created", request.requestId, {
+      familyId, packageName: request.packageName
+    });
+    return clone(request);
+  }
+
+  listAppInstallRequests({ deviceId = "", familyId = "", status = "pending" } = {}) {
+    const filter = String(status || "pending");
+    if (!["pending", "all"].includes(filter)) throw new StoreError("invalid_app_install_request_status", 400);
+    const activeDeviceFamilyId = deviceId ? this.requireConfirmedAndroidDevice(deviceId) : "";
+    this.expireAppInstallRequests();
+    return (this.state.appInstallRequests || [])
+      .filter((request) => {
+        if (deviceId && request.deviceId !== deviceId) return false;
+        if (activeDeviceFamilyId && request.familyId !== activeDeviceFamilyId) return false;
+        if (familyId && (request.familyId !== familyId
+            || !this.state.devices[request.deviceId]
+            || this.state.devices[request.deviceId].platform !== "android"
+            || this.familyIdForDevice(request.deviceId) !== familyId)) return false;
+        return filter === "all" || request.status === "pending";
+      })
+      .sort((left, right) => String(right.createdAt).localeCompare(String(left.createdAt)) || right.requestId.localeCompare(left.requestId))
+      .map(clone);
+  }
+
+  cancelAppInstallRequest({ requestId, deviceId }) {
+    const familyId = this.requireConfirmedAndroidDevice(deviceId);
+    this.expireAppInstallRequests();
+    const request = (this.state.appInstallRequests || []).find((item) => item.requestId === String(requestId || "")
+      && item.deviceId === String(deviceId || "") && item.familyId === familyId);
+    if (!request) throw new StoreError("app_install_request_not_found", 404);
+    if (request.status !== "pending") throw new StoreError("app_install_request_not_pending", 409);
+    request.status = "cancelled";
+    request.decidedAt = nowIso();
+    this.save();
+    this.audit("device", request.deviceId, "app_install_request_cancelled", request.requestId, { familyId });
+    return clone(request);
+  }
+
+  decideAppInstallRequest({ requestId, familyId, parentId, decision, decisionNote }) {
+    const action = String(decision || "");
+    if (!["approve", "deny"].includes(action)) throw new StoreError("invalid_decision", 400);
+    const note = this.normalizeAppInstallDecisionNote(decisionNote);
+    this.expireAppInstallRequests();
+    const request = (this.state.appInstallRequests || []).find((item) => item.requestId === String(requestId || "")
+      && item.familyId === String(familyId || "")
+      && this.state.devices[item.deviceId]?.platform === "android"
+      && this.familyIdForDevice(item.deviceId) === String(familyId || ""));
+    if (!request) throw new StoreError("app_install_request_not_found", 404);
+    if (request.status !== "pending") throw new StoreError("app_install_request_not_pending", 409);
+    request.status = action === "approve" ? "approved" : "denied";
+    request.decidedAt = nowIso();
+    request.decisionNote = note;
+    this.save();
+    this.audit("parent", parentId, "app_install_request_decided", request.requestId, {
+      familyId: request.familyId, deviceId: request.deviceId, decision: action
+    });
+    return clone(request);
+  }
+
+  publicAppInstallRequest(request) {
+    return {
+      request_id: request.requestId,
+      device_id: request.deviceId,
+      child_name: request.childName,
+      package_name: request.packageName,
+      display_name: request.displayName,
+      request_note: request.requestNote,
+      status: request.status,
+      created_at: request.createdAt,
+      expires_at: request.expiresAt,
+      decided_at: request.decidedAt || null,
+      decision_note: request.decisionNote || null
+    };
+  }
+
+  requireMissionParent(familyId, parentId) {
+    const family = this.state.families[String(familyId || "")];
+    const parent = this.state.parentProfiles[String(parentId || "")];
+    const member = (this.state.familyMembers || []).find((item) => item.familyId === String(familyId || "")
+      && item.memberType === "parent" && item.memberId === String(parentId || "") && item.status === "active");
+    if (!family || family.status !== "active" || !parent || parent.status !== "active"
+        || parent.familyId !== String(familyId || "") || !member) {
+      throw new StoreError("parent_family_membership_required", 403);
+    }
+    return String(familyId);
+  }
+
+  requireMissionChild(deviceId, expectedFamilyId = "") {
+    const id = String(deviceId || "");
+    const device = this.state.devices[id];
+    if (!device) throw new StoreError("device_not_found", 404);
+    if (device.platform !== "android") throw new StoreError("android_device_required", 409);
+    const child = Object.values(this.state.childProfiles || {}).find((item) => item.deviceId === id && item.status === "active");
+    const mapping = child && Object.values(this.state.parentChildMappings || {}).find((item) => item.childId === child.childId
+      && item.status === "confirmed" && item.parentConsent === true && item.childConsent === true
+      && this.state.families[item.familyId]?.status === "active");
+    const member = mapping && (this.state.familyMembers || []).find((item) => item.familyId === mapping.familyId
+      && item.memberType === "child" && item.memberId === child.childId && item.status === "active");
+    if (!mapping || !member || device.registrationStatus !== "registered_paired") {
+      throw new StoreError("parent_mapping_required", 409);
+    }
+    if (expectedFamilyId && mapping.familyId !== String(expectedFamilyId)) {
+      throw new StoreError("mission_not_found", 404);
+    }
+    return { device, child, familyId: mapping.familyId };
+  }
+
+  validateMissionText(value, field, maxLength, required = true) {
+    if (typeof value !== "string") throw new StoreError(`invalid_mission_${field}`, 400);
+    const text = value.trim();
+    if ((required && !text) || text.length > maxLength || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text)) {
+      throw new StoreError(`invalid_mission_${field}`, 400);
+    }
+    return text;
+  }
+
+  missionLatestSubmission(missionId) {
+    return (this.state.missionSubmissions || [])
+      .filter((item) => item.missionId === missionId)
+      .sort((left, right) => String(right.submittedAt).localeCompare(String(left.submittedAt))
+        || right.submissionId.localeCompare(left.submissionId))[0] || null;
+  }
+
+  publicMission(mission) {
+    if (!mission) return null;
+    const latest = this.missionLatestSubmission(mission.missionId);
+    return {
+      mission_id: mission.missionId,
+      device_id: mission.deviceId,
+      title: mission.title,
+      instructions: mission.instructions,
+      bonus_minutes: mission.bonusMinutes,
+      status: mission.status,
+      created_at: mission.createdAt,
+      updated_at: mission.updatedAt,
+      cancelled_at: mission.cancelledAt || null,
+      latest_submission: latest ? this.publicMissionSubmission(latest) : null
+    };
+  }
+
+  publicMissionSubmission(submission) {
+    if (!submission) return null;
+    const review = (this.state.missionReviews || []).find((item) => item.submissionId === submission.submissionId
+      && item.missionId === submission.missionId && item.familyId === submission.familyId) || null;
+    return {
+      submission_id: submission.submissionId,
+      mission_id: submission.missionId,
+      device_id: submission.deviceId,
+      message: submission.message,
+      status: submission.status,
+      submitted_at: submission.submittedAt,
+      reviewed_at: review ? review.reviewedAt : null,
+      decision: review ? review.decision : null,
+      note: review ? (review.note || null) : null
+    };
+  }
+
+  publicMissionReview(review) {
+    if (!review) return null;
+    return {
+      review_id: review.reviewId,
+      submission_id: review.submissionId,
+      decision: review.decision,
+      note: review.note || null,
+      parent_id: review.parentId,
+      reviewed_at: review.reviewedAt
+    };
+  }
+
+  publicMissionReward(reward) {
+    if (!reward) return null;
+    const command = reward.commandId
+      ? (this.state.commands || []).find((item) => item.id === reward.commandId && item.deviceId === reward.deviceId)
+      : null;
+    return {
+      reward_id: reward.rewardId,
+      submission_id: reward.submissionId,
+      bonus_minutes: reward.bonusMinutes,
+      command_id: reward.commandId || null,
+      command_state: command ? (command.state || command.status || "unknown")
+        : (Number(reward.bonusMinutes) === 0 ? "praise_only" : "unknown"),
+      granted_at: reward.grantedAt
+    };
+  }
+
+  publicMissionCommand(command) {
+    if (!command) return null;
+    return {
+      id: command.id,
+      device_id: command.deviceId,
+      type: command.type,
+      payload: clone(command.payload),
+      state: command.state,
+      idempotency_key: command.idempotencyKey,
+      created_at: command.createdAt
+    };
+  }
+
+  saveMissionMutation(mutate, auditInfo = null) {
+    const backup = {
+      missions: clone(this.state.missions || []),
+      missionSubmissions: clone(this.state.missionSubmissions || []),
+      missionReviews: clone(this.state.missionReviews || []),
+      missionRewards: clone(this.state.missionRewards || []),
+      missionCreateRequests: clone(this.state.missionCreateRequests || []),
+      auditLog: clone(this.state.auditLog || []),
+      commands: clone(this.state.commands || [])
+    };
+    try {
+      const result = mutate();
+      let auditEntry = null;
+      if (auditInfo) {
+        const info = typeof auditInfo === "function" ? auditInfo(result) : auditInfo;
+        auditEntry = this.makeAuditEntry(info.actorType, info.actorId, info.action, info.requestId, info.metadata);
+        this.state.auditLog = [...(this.state.auditLog || []), auditEntry].slice(-10000);
+      }
+      if (this.sqlite && this.db) this.saveSqlite(auditEntry ? [auditEntry] : []);
+      else this.save();
+      return clone(result);
+    } catch (error) {
+      Object.assign(this.state, backup);
+      throw error;
+    }
+  }
+
+  createMission({ familyId, parentId, deviceId, title, instructions, bonusMinutes, requestId }) {
+    const family = this.requireMissionParent(familyId, parentId);
+    if (typeof requestId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId)) {
+      throw new StoreError("invalid_mission_request_id", 400);
+    }
+    if (typeof deviceId !== "string" || !deviceId.trim()) throw new StoreError("invalid_mission_device_id", 400);
+    const child = this.requireMissionChild(deviceId, family);
+    const missionTitle = this.validateMissionText(title, "title", 80);
+    const missionInstructions = this.validateMissionText(instructions, "instructions", 1000);
+    if (!Number.isInteger(bonusMinutes) || bonusMinutes < 0 || bonusMinutes > 240) {
+      throw new StoreError("invalid_mission_bonus_minutes", 400);
+    }
+    const payloadFingerprint = crypto.createHash("sha256").update(canonicalJson({
+      deviceId: child.device.deviceId, title: missionTitle,
+      instructions: missionInstructions, bonusMinutes
+    })).digest("hex");
+    const priorRequest = (this.state.missionCreateRequests || []).find((item) => item.familyId === family
+      && item.parentId === String(parentId) && item.requestId === requestId);
+    if (priorRequest) {
+      if (priorRequest.payloadFingerprint !== payloadFingerprint) throw new StoreError("mission_request_id_conflict", 409);
+      const priorMission = (this.state.missions || []).find((item) => item.missionId === priorRequest.missionId
+        && item.familyId === family && item.createdByParentId === String(parentId));
+      if (!priorMission) throw new StoreError("mission_request_mapping_invalid", 409);
+      return { mission: clone(priorMission), created: false };
+    }
+    const now = nowIso();
+    const mission = {
+      missionId: crypto.randomUUID(), familyId: family, deviceId: child.device.deviceId,
+      createdByParentId: String(parentId), title: missionTitle, instructions: missionInstructions,
+      bonusMinutes, status: "active", createdAt: now, updatedAt: now, cancelledAt: null
+    };
+    const requestMapping = {
+      familyId: family, parentId: String(parentId), requestId,
+      payloadFingerprint, missionId: mission.missionId, createdAt: now
+    };
+    this.saveMissionMutation(() => {
+      this.state.missions.push(mission);
+      this.state.missionCreateRequests.push(requestMapping);
+      return mission;
+    }, {
+      actorType: "parent", actorId: String(parentId), action: "mission_created", requestId,
+      metadata: { familyId: family, deviceId: child.device.deviceId, missionId: mission.missionId, bonusMinutes }
+    });
+    return { mission: clone(mission), created: true };
+  }
+
+  listMissionsForParent({ familyId, parentId, status = "all" }) {
+    const allowed = new Set(["all", "active", "pending_review", "completed", "cancelled"]);
+    const filter = String(status || "all");
+    if (!allowed.has(filter)) throw new StoreError("invalid_mission_status", 400);
+    this.requireMissionParent(familyId, parentId);
+    return (this.state.missions || [])
+      .filter((mission) => mission.familyId === String(familyId)
+        && (!filter || filter === "all" || mission.status === filter)
+        && this.isMissionCurrent(mission))
+      .sort((left, right) => String(right.createdAt).localeCompare(String(left.createdAt))
+        || right.missionId.localeCompare(left.missionId))
+      .map((mission) => this.publicMission(mission));
+  }
+
+  listMissionsForChild({ deviceId, status = "all" }) {
+    const filter = String(status || "all");
+    if (!["all", "active"].includes(filter)) throw new StoreError("invalid_mission_status", 400);
+    const child = this.requireMissionChild(deviceId);
+    return (this.state.missions || [])
+      .filter((mission) => mission.deviceId === child.device.deviceId && mission.familyId === child.familyId
+        && (filter === "all" || mission.status === "active"))
+      .sort((left, right) => String(right.createdAt).localeCompare(String(left.createdAt))
+        || right.missionId.localeCompare(left.missionId))
+      .map((mission) => this.publicMission(mission));
+  }
+
+  listMissionRewardsForChild({ deviceId, limit = 50 }) {
+    const child = this.requireMissionChild(deviceId);
+    const maximum = Number(limit);
+    if (!Number.isInteger(maximum) || maximum < 1 || maximum > 100) {
+      throw new StoreError("invalid_mission_reward_limit", 400);
+    }
+    return (this.state.missionRewards || [])
+      .filter((reward) => reward.deviceId === child.device.deviceId && reward.familyId === child.familyId)
+      .sort((left, right) => String(right.grantedAt).localeCompare(String(left.grantedAt))
+        || right.rewardId.localeCompare(left.rewardId))
+      .slice(0, maximum)
+      .map((reward) => {
+        const mission = (this.state.missions || []).find((item) => item.missionId === reward.missionId
+          && item.familyId === child.familyId && item.deviceId === child.device.deviceId);
+        return {
+          ...this.publicMissionReward(reward),
+          mission_id: reward.missionId,
+          mission_title: mission ? mission.title : "미션"
+        };
+      });
+  }
+
+  isMissionCurrent(mission) {
+    try { return this.requireMissionChild(mission.deviceId, mission.familyId).familyId === mission.familyId; }
+    catch (_) { return false; }
+  }
+
+  cancelMission({ missionId, familyId, parentId }) {
+    this.requireMissionParent(familyId, parentId);
+    const mission = (this.state.missions || []).find((item) => item.missionId === String(missionId || "")
+      && item.familyId === String(familyId || "") && this.isMissionCurrent(item));
+    if (!mission) throw new StoreError("mission_not_found", 404);
+    if (mission.status !== "active") throw new StoreError("mission_not_active", 409);
+    const now = nowIso();
+    this.saveMissionMutation(() => {
+      mission.status = "cancelled";
+      mission.updatedAt = now;
+      mission.cancelledAt = now;
+      return mission;
+    }, {
+      actorType: "parent", actorId: String(parentId), action: "mission_cancelled",
+      metadata: { familyId: mission.familyId, deviceId: mission.deviceId, missionId: mission.missionId }
+    });
+    return this.publicMission(mission);
+  }
+
+  submitMission({ missionId, deviceId, message }) {
+    const child = this.requireMissionChild(deviceId);
+    const submissionMessage = this.validateMissionText(message, "message", 2000);
+    const mission = (this.state.missions || []).find((item) => item.missionId === String(missionId || "")
+      && item.deviceId === child.device.deviceId && item.familyId === child.familyId);
+    if (!mission) throw new StoreError("mission_not_found", 404);
+    if (mission.status !== "active") throw new StoreError("mission_not_active", 409);
+    const submission = {
+      submissionId: crypto.randomUUID(), missionId: mission.missionId,
+      familyId: mission.familyId, deviceId: child.device.deviceId,
+      message: submissionMessage, status: "pending_review", submittedAt: nowIso()
+    };
+    this.saveMissionMutation(() => {
+      this.state.missionSubmissions.push(submission);
+      mission.status = "pending_review";
+      mission.updatedAt = submission.submittedAt;
+      return submission;
+    }, {
+      actorType: "device", actorId: child.device.deviceId, action: "mission_text_submitted",
+      metadata: {
+        familyId: mission.familyId, deviceId: child.device.deviceId,
+        missionId: mission.missionId, submissionId: submission.submissionId
+      }
+    });
+    return { submission: clone(submission), mission: this.publicMission(mission) };
+  }
+
+  reviewMission({ missionId, submissionId, familyId, parentId, decision, note }) {
+    this.requireMissionParent(familyId, parentId);
+    const action = String(decision || "");
+    if (!["approve", "reject"].includes(action)) throw new StoreError("invalid_mission_decision", 400);
+    let reviewNote = null;
+    if (note !== undefined && note !== null) reviewNote = this.validateMissionText(note, "note", 500, false) || null;
+    const mission = (this.state.missions || []).find((item) => item.missionId === String(missionId || "")
+      && item.familyId === String(familyId || "") && this.isMissionCurrent(item));
+    const submission = (this.state.missionSubmissions || []).find((item) => item.submissionId === String(submissionId || "")
+      && item.missionId === String(missionId || "") && item.familyId === String(familyId || ""));
+    if (!mission || !submission || submission.deviceId !== mission.deviceId) throw new StoreError("mission_submission_not_found", 404);
+    const priorReview = (this.state.missionReviews || []).find((item) => item.submissionId === submission.submissionId);
+    if (priorReview) {
+      if (priorReview.decision !== action) throw new StoreError("mission_submission_already_reviewed", 409);
+      const reward = (this.state.missionRewards || []).find((item) => item.submissionId === submission.submissionId) || null;
+      const command = reward?.commandId
+        ? (this.state.commands || []).find((item) => item.id === reward.commandId) || null
+        : null;
+      return {
+        mission: this.publicMission(mission), submission: this.publicMissionSubmission(submission),
+        review: this.publicMissionReview(priorReview), reward: this.publicMissionReward(reward),
+        command: this.publicMissionCommand(command)
+      };
+    }
+    if (submission.status !== "pending_review" || mission.status !== "pending_review") {
+      throw new StoreError("mission_submission_not_pending", 409);
+    }
+    const reviewedAt = nowIso();
+    const review = {
+      reviewId: crypto.randomUUID(), submissionId: submission.submissionId,
+      missionId: mission.missionId, familyId: mission.familyId,
+      parentId: String(parentId), decision: action, note: reviewNote, reviewedAt
+    };
+    let reward = null;
+    let command = null;
+    this.saveMissionMutation(() => {
+      submission.status = action === "approve" ? "approved" : "rejected";
+      mission.status = action === "approve" ? "completed" : "active";
+      mission.updatedAt = reviewedAt;
+      this.state.missionReviews.push(review);
+      if (action === "approve") {
+        const existingReward = (this.state.missionRewards || []).find((item) => item.submissionId === submission.submissionId);
+        if (existingReward) {
+          reward = existingReward;
+        } else {
+          const rewardId = crypto.randomUUID();
+          const commandKey = `mission-reward:${submission.submissionId}`;
+          if (mission.bonusMinutes > 0) {
+            command = (this.state.commands || []).find((item) => item.deviceId === mission.deviceId
+              && item.idempotencyKey === commandKey) || null;
+            if (!command) {
+              command = {
+                id: crypto.randomUUID(), deviceId: mission.deviceId, type: "screen_time.bonus",
+                payload: { minutes: mission.bonusMinutes, requestId: submission.submissionId, issuedAt: reviewedAt },
+                state: "queued", status: "queued", ack: null, result: null, retryCount: 0,
+                maxRetries: this.maxCommandRetries, idempotencyKey: commandKey, leaseExpiresAt: null,
+                expiresAt: new Date(Date.parse(reviewedAt) + 60 * 60 * 1000).toISOString(),
+                createdAt: reviewedAt, deliveredAt: null, completedAt: null
+              };
+              this.state.commands.push(command);
+            }
+          }
+          reward = {
+            rewardId, submissionId: submission.submissionId, missionId: mission.missionId,
+            familyId: mission.familyId, deviceId: mission.deviceId,
+            bonusMinutes: mission.bonusMinutes, commandId: command ? command.id : null,
+            grantedAt: reviewedAt
+          };
+          this.state.missionRewards.push(reward);
+        }
+      }
+      return review;
+    }, () => ({
+      actorType: "parent", actorId: String(parentId),
+      action: action === "approve" ? "mission_approved" : "mission_rejected",
+      metadata: {
+        familyId: mission.familyId, deviceId: mission.deviceId, missionId: mission.missionId,
+        submissionId: submission.submissionId, decision: action,
+        bonusMinutes: mission.bonusMinutes, commandId: command ? command.id : null
+      }
+    }));
+    return {
+      mission: this.publicMission(mission), submission: this.publicMissionSubmission(submission),
+      review: this.publicMissionReview(review), reward: this.publicMissionReward(reward),
+      command: this.publicMissionCommand(command)
+    };
+  }
+
   listGeofences(familyId) {
     const target = String(familyId || "");
     if (!target) return [];
@@ -2073,7 +2795,7 @@ class Store {
       if (!["queued", "deferred"].includes(request.status) || Date.parse(request.expiresAt) > now) continue;
       request.status = "expired";
       request.resultCode = "request_expired";
-      request.updatedAt = nowIso();
+      request.updatedAt = request.expiresAt;
       const command = this.state.commands.find((item) => item.id === request.commandId);
       if (command && !["succeeded", "failed", "expired"].includes(command.state)) {
         command.state = "expired";
@@ -2126,6 +2848,7 @@ class Store {
     }
     return changed;
   }
+
 
   createLocationRequest({ deviceId, familyId, parentId, expiryMs = 60 * 60 * 1000 }) {
     const targetDevice = String(deviceId || "");
@@ -2208,37 +2931,43 @@ class Store {
 
   recordLocationSample({ deviceId, sample }) {
     const targetDevice = String(deviceId || "");
-    const request = this.state.locationRequests[String(sample.requestId || "")];
-    if (!request || request.deviceId !== targetDevice) throw new StoreError("location_request_not_found", 404);
+    const captureType = sample.captureType || "parent_request";
+    const request = captureType === "scheduled" ? null : this.state.locationRequests[String(sample.requestId || "")];
+    if (captureType !== "scheduled" && (!request || request.deviceId !== targetDevice)) throw new StoreError("location_request_not_found", 404);
     const device = this.state.devices[targetDevice];
-    if (!device || device.platform !== "android" || this.familyIdForDevice(targetDevice) !== request.familyId) {
+    const familyId = request ? request.familyId : this.familyIdForDevice(targetDevice);
+    if (!device || device.platform !== "android" || !familyId || this.familyIdForDevice(targetDevice) !== familyId) {
       throw new StoreError("device_not_found", 404);
     }
-    const consent = this.getLocationConsent(targetDevice, request.familyId);
+    const consent = this.getLocationConsent(targetDevice, familyId);
     if (!consent.parentConsented || !consent.childConsented || !consent.permissionGranted) {
       throw new StoreError("location_consent_required", 403);
     }
     const key = `${targetDevice}:${sample.sampleId}`;
     const existing = this.state.locationSamples[key];
     if (existing) {
-      if (existing.requestId !== request.requestId) throw new StoreError("location_sample_conflict", 409);
+      if ((existing.requestId || "") !== (sample.requestId || "") || (existing.captureType || "parent_request") !== captureType) throw new StoreError("location_sample_conflict", 409);
       return { sample: clone(existing), transitions: [], duplicate: true };
     }
-    if (!["queued", "deferred"].includes(request.status)) throw new StoreError("location_request_not_pending", 409);
     const capturedMs = Date.parse(sample.capturedAt);
-    const createdMs = Date.parse(request.createdAt);
-    const expiresMs = Date.parse(request.expiresAt);
     const nowMs = Date.now();
-    if (capturedMs < createdMs - 60_000 || capturedMs > expiresMs || capturedMs > nowMs + 60_000) {
-      throw new StoreError("location_sample_outside_request_window", 400);
+    if (request) {
+      if (!["queued", "deferred"].includes(request.status)) throw new StoreError("location_request_not_pending", 409);
+      const createdMs = Date.parse(request.createdAt);
+      const expiresMs = Date.parse(request.expiresAt);
+      if (capturedMs < createdMs - 60_000 || capturedMs > expiresMs || capturedMs > nowMs + 60_000) {
+        throw new StoreError("location_sample_outside_request_window", 400);
+      }
+    } else if (capturedMs < nowMs - this.locationRetentionDays * 24 * 60 * 60 * 1000 || capturedMs > nowMs + 60_000) {
+      throw new StoreError("location_sample_timestamp_out_of_range", 400);
     }
     const receivedAt = nowIso();
     const stored = {
-      ...clone(sample), deviceId: targetDevice, familyId: request.familyId, receivedAt
+      ...clone(sample), deviceId: targetDevice, familyId, requestId: request ? request.requestId : "", captureType, receivedAt
     };
     this.state.locationSamples[key] = stored;
     const transitions = [];
-    for (const geofence of this.listGeofences(request.familyId).filter((item) => item.enabled)) {
+    for (const geofence of this.listGeofences(familyId).filter((item) => item.enabled)) {
       const classification = classifyGeofence(geofence, stored);
       if (classification.state === "uncertain") continue;
       const stateKey = `${targetDevice}:${geofence.geofenceId}`;
@@ -2261,23 +2990,25 @@ class Store {
         distanceMeters: classification.distanceMeters, accuracyMeters: stored.accuracyMeters
       };
     }
-    request.status = "captured";
-    request.resultCode = "captured";
-    request.sampleId = stored.sampleId;
-    request.updatedAt = receivedAt;
-    const command = this.state.commands.find((item) => item.id === request.commandId);
-    if (command) {
-      command.state = "succeeded";
-      command.status = "succeeded";
-      command.ack = { ok: true, state: "location_uploaded" };
-      command.result = { ok: true, state: "location_uploaded", sample_id: stored.sampleId };
-      command.completedAt = receivedAt;
-      command.leaseExpiresAt = null;
+    if (request) {
+      request.status = "captured";
+      request.resultCode = "captured";
+      request.sampleId = stored.sampleId;
+      request.updatedAt = receivedAt;
+      const command = this.state.commands.find((item) => item.id === request.commandId);
+      if (command) {
+        command.state = "succeeded";
+        command.status = "succeeded";
+        command.ack = { ok: true, state: "location_uploaded" };
+        command.result = { ok: true, state: "location_uploaded", sample_id: stored.sampleId };
+        command.completedAt = receivedAt;
+        command.leaseExpiresAt = null;
+      }
     }
     this.purgeLocationData(nowMs);
     this.save();
-    this.audit("device", targetDevice, "location_sample_received", request.requestId, {
-      sampleId: stored.sampleId, capturedAt: stored.capturedAt, accuracyMeters: stored.accuracyMeters,
+    this.audit("device", targetDevice, "location_sample_received", request ? request.requestId : null, {
+      sampleId: stored.sampleId, captureType: stored.captureType, capturedAt: stored.capturedAt, accuracyMeters: stored.accuracyMeters,
       provider: stored.provider, batteryPercent: stored.batteryPercent, transitionCount: transitions.length
     });
     return { sample: clone(stored), transitions, duplicate: false };
@@ -2302,7 +3033,58 @@ class Store {
       .filter((item) => item.deviceId === targetDevice && item.familyId === targetFamily)
       .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
       .slice(0, 5);
-    return { samples: clone(samples), transitions: clone(transitions), requests: clone(requests), retentionDays: this.locationRetentionDays };
+    return {
+      samples: clone(samples), transitions: clone(transitions), requests: clone(requests),
+      retentionDays: this.locationRetentionDays,
+      sampleIntervalMs: this.locationSampleIntervalMs
+    };
+  }
+
+  // Co-guardian invite: an authenticated parent shows a one-time QR, another parent app scans it
+  // and joins the family. Invites live in memory only (10 min TTL) — a restart simply voids them.
+  createFamilyInvite({ familyId, parentId, ttlMs = 600000 }) {
+    if (!familyId || !parentId) throw new StoreError("parent_session_profile_required", 403);
+    const inviteId = crypto.randomUUID();
+    const inviteCode = crypto.randomBytes(24).toString("base64url");
+    const now = Date.now();
+    this.familyInvites = (this.familyInvites || []).filter((item) => item.expiresAt > now && item.status === "pending");
+    this.familyInvites.push({
+      inviteId, familyId, issuerParentId: parentId, status: "pending",
+      codeHash: crypto.createHash("sha256").update(inviteCode, "utf8").digest("hex"),
+      createdAt: new Date(now).toISOString(), expiresAt: now + ttlMs
+    });
+    return { inviteId, inviteCode, expiresAt: new Date(now + ttlMs).toISOString(), familyId };
+  }
+
+  acceptFamilyInvite({ inviteId, inviteCode, parentId }) {
+    const invite = (this.familyInvites || []).find((item) => item.inviteId === String(inviteId || ""));
+    if (!invite) throw new StoreError("family_invite_not_found", 404);
+    if (invite.status !== "pending" || invite.expiresAt <= Date.now()) throw new StoreError("family_invite_expired", 410);
+    const expected = Buffer.from(invite.codeHash, "hex");
+    const actual = crypto.createHash("sha256").update(String(inviteCode || ""), "utf8").digest();
+    if (expected.length !== actual.length || !crypto.timingSafeEqual(expected, actual)) throw new StoreError("family_invite_code_invalid", 403);
+    const parent = this.state.parentProfiles[String(parentId || "")];
+    if (!parent) throw new StoreError("parent_session_profile_required", 403);
+    if (parent.parentId === invite.issuerParentId || parent.familyId === invite.familyId) throw new StoreError("family_invite_same_family", 409);
+    // Moving a parent who already guards children would strand those children in an empty family.
+    if (this.familyDeviceIds(parent.familyId).length > 0) throw new StoreError("parent_family_has_children", 409);
+    const previousFamilyId = parent.familyId;
+    parent.familyId = invite.familyId;
+    parent.updatedAt = nowIso();
+    this.state.familyMembers = this.state.familyMembers.filter((item) => !(item.memberType === "parent" && item.memberId === parent.parentId));
+    this.state.familyMembers.push({ familyId: invite.familyId, memberType: "parent", memberId: parent.parentId, role: "guardian", status: "active", createdAt: nowIso() });
+    // Old sessions carry the previous family scope; the app re-enrolls and gets the new one.
+    this.state.parentSessions = (this.state.parentSessions || []).filter((item) => item.parent_id !== parent.parentId);
+    invite.status = "accepted";
+    invite.acceptedBy = parent.parentId;
+    this.save();
+    return { familyId: invite.familyId, previousFamilyId, issuerParentId: invite.issuerParentId, parentId: parent.parentId };
+  }
+
+  familyParentIds(familyId) {
+    return (this.state.familyMembers || [])
+      .filter((item) => item.familyId === familyId && item.memberType === "parent" && (item.status || "active") === "active")
+      .map((item) => item.memberId);
   }
 
   familyDeviceIds(familyId) {
@@ -2313,6 +3095,18 @@ class Store {
       if (mapping.familyId !== target || mapping.status !== "confirmed") continue;
       const child = this.state.childProfiles[mapping.childId];
       if (child && child.deviceId && this.state.devices[child.deviceId]) ids.add(child.deviceId);
+    }
+    return [...ids];
+  }
+
+  familyParentIds(familyId) {
+    const target = String(familyId || "");
+    if (!target) return [];
+    const ids = new Set((this.state.familyMembers || [])
+      .filter((member) => member.familyId === target && member.memberType === "parent" && member.status === "active")
+      .map((member) => String(member.memberId || "")).filter(Boolean));
+    for (const mapping of Object.values(this.state.parentChildMappings || {})) {
+      if (mapping.familyId === target && mapping.status === "confirmed" && mapping.parentId) ids.add(String(mapping.parentId));
     }
     return [...ids];
   }
@@ -2446,8 +3240,28 @@ class Store {
     return changed;
   }
 
+  isUndeliveredMissionRewardCommand(command) {
+    if (!command || command.type !== "screen_time.bonus" || command.state !== "queued"
+        || command.deliveredAt || command.ack || command.result || command.completedAt
+        || !String(command.idempotencyKey || "").startsWith("mission-reward:")) return false;
+    return (this.state.missionRewards || []).some((reward) => reward.commandId === command.id
+      && reward.deviceId === command.deviceId && Number(reward.bonusMinutes) > 0
+      && command.idempotencyKey === `mission-reward:${reward.submissionId}`
+      && Number(command.payload && command.payload.minutes) === Number(reward.bonusMinutes));
+  }
+
   pollCommands(deviceId, limit = 20, leaseMs = Number(process.env.CPSM_COMMAND_LEASE_MS || 30000)) {
-    const changed = this.expireAndRequeueCommands(Date.now());
+    const now = Date.now();
+    let renewedMissionReward = false;
+    for (const command of this.state.commands) {
+      if (command.deviceId !== deviceId || !this.isUndeliveredMissionRewardCommand(command)) continue;
+      const expiresAt = Date.parse(command.expiresAt || "");
+      if (!Number.isFinite(expiresAt) || expiresAt <= now) {
+        command.expiresAt = new Date(now + MISSION_REWARD_COMMAND_TTL_MS).toISOString();
+        renewedMissionReward = true;
+      }
+    }
+    const changed = this.expireAndRequeueCommands(now) || renewedMissionReward;
     const commands = this.state.commands.filter((command) => command.deviceId === deviceId && command.state === "queued").slice(0, Math.max(1, Math.min(100, limit)));
     const leaseExpiresAt = new Date(Date.now() + leaseMs).toISOString();
     for (const command of commands) {
@@ -2557,6 +3371,10 @@ class Store {
     const source = selectedFamilyPolicy && selectedFamilyPolicy.policy ? selectedFamilyPolicy.policy : this.state.policy;
     const rules = (source.rules || [])
       .filter((rule) => !rule.platform || rule.platform === platform)
+      .filter((rule) => {
+        const targetDeviceId = String(rule.deviceId || rule.device_id || "");
+        return !targetDeviceId || targetDeviceId === deviceId;
+      })
       .filter((rule) => !rule.excludedUntil || Date.parse(rule.excludedUntil) < Date.now())
       .map((rule) => ({
         id: rule.id,
