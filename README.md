@@ -257,4 +257,10 @@ npm run test:v2    # strict 인증: 스코프/가족 격리, 탈취·재페어�
 - 규칙 저장(`PUT /api/parent/policies/current`, `POST /api/parent/blocked-apps`) 시 같은 가족의 **다른** 부모에게 FCM `cpsm_policy_changed {family_id, policy_version}`(데이터만), 응답에 `parents_notified`.
 - 시험: `npm run test:family-invite`(17 assertions). 전체 `check`·smoke·location·v2·app-install-requests·missions 통과.
 
-**배포 상태 (2026-11-03)**: 운영 `/home/ubuntu/web-service/cpsm-server` 는 아직 **2026-09-28 코드**다. 2026-10-15 작업(미션·앱 설치 요청·정기 위치 `capture_type`)과 이 변경은 저장소에만 있고 운영 반영 전이다. 운영 FCM 은 꺼져 있다(`CPSM_DISABLE_FCM=1`, `secrets/firebase-adminsdk.json` 없음 — Firebase 프로젝트 `childrens-pc-sec-monit` Admin SDK 키 필요). 배포 전 백업: `/home/ubuntu/web-service-archive/cpsm-server-deploy-backup-20261103/`.
+**배포 상태 (2026-11-04)**: 운영 `/home/ubuntu/web-service/cpsm-server` 에 이 저장소 코드(10-15 작업 + 11-03 변경) 배포 완료. **운영 FCM 켬**: `.env` 에 `CPSM_FCM_ENABLED=1`, `GOOGLE_APPLICATION_CREDENTIALS=/home/ubuntu/web-service/cpsm-server/secrets/firebase-adminsdk.json`(권한 600, 디렉토리 700, 원본은 AWS prof17 `~/tonemesh/cpsm/`, 저장소에 넣지 말 것). `/api/status` 의 `fcmEnabled: true`, Google 액세스 토큰 발급 확인. OTA: cpsm-m 22 `0.3.0-policy-location-fix`, cpsm-p 26 `0.3.0-coguardian`. 배포 전 백업: `/home/ubuntu/web-service-archive/cpsm/cpsm-server-deploy-backup-20261104/`(src·scripts·package.json·env.backup·cpsm.sqlite) — 되돌리기는 src/scripts/package.json·.env 복원 후 `pm2 restart cpsm-server`.
+
+### 앱 안 업데이트(OTA) 구조
+1. 앱 시작 시(`MainActivity` → `AndroidUpdateManager` / `ParentAndroidUpdateManager.checkAndPrompt`) 빌드에 `-PcpsmOtaCheckEnabled=true` 가 있을 때만 확인한다.
+2. 공개 `GET /api/updates/manifest?platform=android&product=cpsm-m|cpsm-p` 의 `versionCode` 가 설치본보다 크면 업데이트 창(릴리스 노트, [나중에]=그 버전 24시간 보류 / [다운로드 및 설치]).
+3. APK 를 받아 manifest 의 크기·SHA-256, APK 서명 인증서 SHA-256(빌드에 박힌 값·설치본 서명과 모두 같아야)을 확인한 뒤 Android 설치 화면을 연다(사용자가 [업데이트]; 알 수 없는 앱 설치 허용 필요).
+4. 게시: `set -a; . ./.env; set +a; node scripts/publish-artifact.js --platform android --product cpsm-m --input APK --version-code N --version-name V --package-name com.cpsm.child --signing-certificate-sha256 6c28… --release-notes "…"` → `artifacts/android/<product>/latest.json` 갱신(옛 APK 는 그대로 보관).
