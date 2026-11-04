@@ -8,10 +8,10 @@ The server uses SQLite at `data/cpsm.sqlite`. `state.json` remains a compatibili
 - `parent_profiles`: logical parent profile linked to a family and a parent-device fingerprint; Android enrollment metadata is stored for compatibility diagnostics.
 - `child_profiles`: logical child profile linked to exactly one device.
 - `families`: family grouping unit.
-- `family_members`: many-to-many membership between a family and parent/child profiles.
+- `family_members`: many-to-many membership between a family and parent/child profiles. Parent `role` is `owner` (the self-enrolled family's first parent) or `guardian` (joined through a co-guardian invite, 2026-11-03; kept on re-enrolment). Co-guardian invites themselves are **not persisted** — they live in server memory for 10 minutes (`Store.familyInvites`), so there is no invite table.
 - `parent_child_mappings`: explicit parent-to-child relationship in a family. `confirmed` is derived from the QR preview confirmation or the legacy consent endpoint; the QR confirmation atomically records both consent flags. QR scanning without the confirmation dialog never enables policy delivery.
 - `consent_requests`: independently auditable compatibility records. The QR confirmation updates both records atomically; FCM is only a wake-up/notification transport and the server remains authoritative.
-- `device_notification_keys`: provider tokens associated with a logical device. Real FCM credentials remain disabled in this deployment.
+- `device_notification_keys`: provider tokens associated with a logical device (child `device_id`, or `parent_id` for parent apps). Production FCM sending is enabled since 2026-11-04.
 
 ## Policy and delivery
 
@@ -104,3 +104,6 @@ PATCH  /api/admin/app-versions/{platform}/{product}/{versionCode}/changes/{chang
 Implemented and verified at the server/API level: SQLite lifecycle storage, bidirectional short-lived QR pairing sessions with issuer/claimant role checks, preview confirmation, registration, parent enrollment, mapping, policy assignment/receipt, device/parent API routes, Android runtime compatibility metadata, public Android OTA aliases, and the FCM-disabled status-polling compatibility path. The FCM wake-up and long-poll implementation is not included in this verification claim.
 
 Not yet physically verified: Note8/S21 package-installer approval, Android API 26/31/35/36 device matrix, Device Owner provisioning, Usage Access onboarding, and end-to-end policy commit on a confirmed real-device relationship. Error telemetry upload over a physical Android device and Windows production service deployment remain environment-level verification items.
+
+### Pairing wait (2026-11-04)
+The child long-poll `GET /api/devices/{id}/pairing-sessions/{sid}/wait` reads `pairing_sessions` (+ its `parent_child_mappings.status`) only; claim/confirm wake waiters through an in-process event (`Store.pairingEvents`). No schema change.

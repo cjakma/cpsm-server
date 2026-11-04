@@ -106,7 +106,7 @@ erDiagram
   DEVICES ||..o{ DEVICE_NOTIFICATION_KEYS : device_id
 ```
 
-`family_members` is the active membership/role surface. `parent_child_mappings` separately records the relationship and both compatibility consent flags. QR `pairing_sessions` point to a pending mapping until explicit confirmation. Parent session bearer values are stored as hashes. `device_notification_keys` is unique by `(device_id,provider,token)`.
+`family_members` is the active membership/role surface (parent `role` = `owner` or `guardian`; co-guardian invites are in-memory only, 10 minutes, no table — 2026-11-03). `parent_child_mappings` separately records the relationship and both compatibility consent flags. QR `pairing_sessions` point to a pending mapping until explicit confirmation. Parent session bearer values are stored as hashes. `device_notification_keys` is unique by `(device_id,provider,token)`.
 
 ## Device activity, policy and commands
 
@@ -431,3 +431,8 @@ erDiagram
 ```
 
 `storage_meta(key,value)` tracks schema initialization/migration; `parent_tokens(token,created_at,last_used_at)` is legacy notification compatibility. Both are present in the 38-table inventory but do not add domain relationships beyond those shown above.
+
+## 2026-11-03~04 changes
+- No new tables or columns. Co-guardian join adds a `family_members` parent row with `role='guardian'`, moves `parent_profiles.family_id`, and deletes that parent's `parent_sessions`.
+- The child QR long-poll reads `pairing_sessions.status/expires_at` and the linked `parent_child_mappings.status`.
+- `device_notification_keys` now also hold parent-app tokens keyed by `parent_id`; production FCM is enabled.

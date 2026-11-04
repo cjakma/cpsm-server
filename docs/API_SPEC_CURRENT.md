@@ -51,6 +51,7 @@ All paths below are canonical. `{deviceId}` is a server device ID; `{sessionId}`
 | GET | `/api/devices/{deviceId}/updates/manifest?product=` | Authenticated device OTA manifest; product must match platform. |
 | GET | `/api/devices/{deviceId}/updates/download?product=` | Authenticated device OTA artifact. |
 | POST | `/api/devices/{deviceId}/pairing-sessions` | Child issues one-time pairing session/code; response includes role and expiry. |
+| GET | `/api/devices/{deviceId}/pairing-sessions/{sessionId}/wait?since=pending\|claimed` | Long-poll on the child's own QR (2026-11-04). Answers at once when the state differs from `since` or is terminal (`confirmed`/`declined`/`expired`); otherwise holds until a claim/confirm event or `CPSM_PAIRING_WAIT_MAX_MS` (default 25 s, below guard's 30 s proxy timeout). Body `{status, relationship_status, expires_at, expires_in_ms}`. Other devices' sessions → `404 pairing_session_not_found`. |
 | POST | `/api/devices/{deviceId}/pairing-sessions/{sessionId}/claim` | Child claims parent-issued pairing code; returns name preview. |
 | POST | `/api/devices/{deviceId}/pairing-sessions/{sessionId}/confirm` | Scanner explicitly confirms/declines; server records relationship state. |
 | POST | `/api/devices/{deviceId}/consent-requests/{requestId}/decision` | Child independently records relationship consent. |
@@ -77,6 +78,8 @@ All paths below are canonical. `{deviceId}` is a server device ID; `{sessionId}`
 | GET | `/api/parent/consent-requests` | Parent's consent request history. |
 | POST | `/api/parent/pairing-sessions` | Parent issues one-time QR session/code. |
 | GET | `/api/parent/pairing-sessions/{sessionId}` | Issuer-scoped authoritative QR status. |
+| POST | `/api/parent/family-invites` | Co-guardian invite (2026-11-03): returns `{invite_id, invite_code, expires_at}`; one-time, 10 minutes, held in memory only (a restart voids it). |
+| POST | `/api/parent/family-invites/{inviteId}/accept` | Another parent joins the issuer's family as `guardian`. Body `{invite_code}`. `403 family_invite_code_invalid`, `404 family_invite_not_found`, `410 family_invite_expired` (also when reused), `409 family_invite_same_family`, `409 parent_family_has_children`. Revokes the joiner's sessions (`reenroll_required: true`); re-enrolment keeps the role. Issuer gets FCM `cpsm_family_member_joined`. |
 | POST | `/api/parent/pairing-sessions/{sessionId}/claim` | Claim child-issued code and receive parent/child name preview. |
 | POST | `/api/parent/pairing-sessions/{sessionId}/confirm` | Explicit parent-side scanner confirmation/decline. |
 | GET | `/api/parent/devices/{deviceId}/health` | Current device summary, family-scoped. |
@@ -87,8 +90,8 @@ All paths below are canonical. `{deviceId}` is a server device ID; `{sessionId}`
 | POST | `/api/parent/approval-requests/{requestId}/allow` or `/terminate` | Compatibility decision aliases. |
 | GET | `/api/parent/policies/current` | Current family policy (or legacy/global operator policy). |
 | POST | `/api/parent/policies` | Legacy policy write; body `rules` plus optional `screenTime`. |
-| PUT | `/api/parent/policies/current` | Replace family policy; increments version and queues policy refresh. |
-| GET/POST | `/api/parent/blocked-apps` | Read/add a policy rule; legacy global route is separate from family session behavior. |
+| PUT | `/api/parent/policies/current` | Replace family policy; increments version and queues policy refresh. Other parents of the family get data-only FCM `cpsm_policy_changed {family_id, policy_version}`; response adds `parents_notified {sent, skipped, failed, parents}`. |
+| GET/POST | `/api/parent/blocked-apps` | Read/add a policy rule; legacy global route is separate from family session behavior. Family-session POST also notifies the other parents (`cpsm_policy_changed`, `parents_notified`). |
 | GET/POST | `/api/parent/devices/{deviceId}/commands` | List/queue supported device commands; parent session must access the device's current family. |
 | GET | `/api/parent/app-install-requests?status=pending\|all` | Family-scoped app-install request review queue. |
 | POST | `/api/parent/app-install-requests/{requestId}/decision` | `approve`/`deny`; records permission, never queues silent install. |
@@ -126,6 +129,26 @@ All paths below are canonical. `{deviceId}` is a server device ID; `{sessionId}`
 ### QR relationship
 
 The issuer creates a short-lived one-time pairing session, the opposite role claims the code, and the scanning device receives the name preview. Only the scanner's explicit `confirm` records both compatibility consent flags and sets the relationship confirmed; `consent:false` declines. Claim/FCM is not confirmation. Parent and child route families mirror one another.
+
+### Child QR auto-close (2026-11-04)
+
+While its QR is on screen the child app keeps one long-poll open (`…/pairing-sessions/{id}/wait?since=<last status>`, ≤25 s per request, ≤~5 requests per 2-minute QR, back-off 3 s·6 s…≤30 s on network errors) and closes the QR on `confirmed`; FCM `cpsm_relationship_consent` (already sent to parent and child on confirmation) only triggers an immediate re-check — the push payload is never trusted alone. The dialog shows the remaining time from `expires_at` and offers a new QR at expiry or decline.
+
+### Co-guardian family (2026-11-03)
+
+A parent shows the invite as QR `cpsm://family-invite?version=1&invite_id=…&invite_code=…`; the other parent app scans it with the same "add child" scanner. Membership is a `family_members` row (`member_type=parent`, `role=guardian`); there is no new table. A parent whose own family already has confirmed children cannot join (it would strand them).
+
+### FCM data messages
+
+| type | Recipients | Trigger | Client reaction |
+|---|---|---|---|
+| `cpsm_relationship_consent` | parent + child | relationship confirm/decline | parent notification; child QR re-checks and closes |
+| `cpsm_policy_changed` | other parents of the family | family rule write | open rule list reloads |
+| `cpsm_family_member_joined` | inviting parent | invite accepted | open screens reload |
+| `cpsm_location_refresh` | child | parent location request | pull signed command queue now |
+| `cpsm_location_updated` | family parents | new accepted sample | open location screen reloads |
+
+Production FCM is enabled since 2026-11-04 (`CPSM_FCM_ENABLED=1`, `GOOGLE_APPLICATION_CREDENTIALS`); FCM is best-effort and never authoritative.
 
 ### Family mission
 

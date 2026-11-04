@@ -77,8 +77,11 @@ X-CPSM-Device-Signature:  base64(sign_sha256(privateKey, METHOD \n path \n times
 | POST | `/api/parent/pairing-sessions/{id}/claim` | 👪 | 자녀 QR claim + 이름 preview |
 | POST | `/api/parent/pairing-sessions/{id}/confirm` | 👪 | 확인창 동의/취소 및 관계 확정 |
 | POST | `/api/devices/{id}/pairing-sessions` | 📱 | 자녀 QR 발급 |
+| GET | `/api/devices/{id}/pairing-sessions/{sessionId}/wait?since=` | 📱 | 자녀 QR 상태 롱폴링(≤25초, claim/confirm 즉시 응답) — 2026-11-04 |
 | POST | `/api/devices/{id}/pairing-sessions/{sessionId}/claim` | 📱 | 부모 QR claim + 이름 preview |
 | POST | `/api/devices/{id}/pairing-sessions/{sessionId}/confirm` | 📱 | 확인창 동의/취소 및 관계 확정 |
+| POST | `/api/parent/family-invites` | 👪 | 공동 보호자 초대 발급(1회용·10분) — 2026-11-03 |
+| POST | `/api/parent/family-invites/{id}/accept` | 👪 | 초대 수락 → 그 가족에 `guardian` 으로 참가 |
 | GET/POST | `/api/parent/mappings` | 👪 | 부모-자녀 연결 |
 | POST | `/api/parent/mappings/{id}/consent` | 👪 | 연결 동의 |
 | GET | `/api/parent/consent-requests` | 👪 | 동의 요청 목록 |
@@ -89,7 +92,7 @@ X-CPSM-Device-Signature:  base64(sign_sha256(privateKey, METHOD \n path \n times
 | POST | `/api/parent/approval-requests/{id}/allow\|terminate` | 👪 | 위의 단축형 |
 | GET | `/api/parent/policies/current` | 👪 | 현재 정책 |
 | POST / PUT | `/api/parent/policies` / `/api/parent/policies/current` | 👪 | 정책 저장 (버전 증가) |
-| GET/POST | `/api/parent/blocked-apps` | 👪 | 규칙 목록 / 규칙 추가 (이름은 호환용, 내용은 전체 규칙) |
+| GET/POST | `/api/parent/blocked-apps` | 👪 | 규칙 목록 / 규칙 추가 (이름은 호환용, 내용은 전체 규칙). 규칙 저장(이것과 PUT policies/current) 시 같은 가족의 다른 부모에게 FCM `cpsm_policy_changed`, 응답 `parents_notified` |
 | GET | `/api/parent/updates/manifest\|download?product=cpsm-p` | 👪 | 부모앱 업데이트 |
 | POST | `/api/admin/portal-device/token` | 🛡 | 관리자 FCM 토큰 |
 | POST | `/api/admin/devices/{id}/secret` | 🛡 | 기기 비밀/공개키 발급 |
@@ -120,9 +123,10 @@ claim
 → confirmed일 때 QR 종료
 ```
 
-FCM은 관계 확정의 증거가 아니다. 활성화할 경우 payload에는 `type`, `pairing_session_id`, `status` 정도만 포함하고, Parent는 메시지를 받은 뒤 상태 API를 재조회한다. 운영 FCM은 현재 disabled다.
+FCM은 관계 확정의 증거가 아니다. payload 에는 `type`·`mapping_id`·`relationship_status` 정도만 있고, 받은 쪽은 상태 API 를 다시 읽는다. **운영 FCM 은 2026-11-04 부터 켜져 있다**(`CPSM_FCM_ENABLED=1`).
 
-현재 Parent version 19는 위 상태 API를 1.5초 polling한다. 이는 임시 compatibility path이며, 장시간 QR 표시 때 request가 누적될 수 있다. 최종 설계는 FCM wake-up + 인증 GET 1회이며, FCM이 비활성화·유실된 경우 30~45초 Long Polling을 제한적으로 재연결한다. Long Polling endpoint와 pairing-specific FCM handler는 현재 미구현이다.
+- **자녀가 띄운 QR (2026-11-04 구현)**: 자녀 앱은 QR 이 떠 있는 동안 `GET /api/devices/{id}/pairing-sessions/{sid}/wait?since=<마지막 상태>` 롱폴링을 하나 유지한다(요청당 ≤25초 — guard 프록시 30초 아래, 2분 QR 당 많아야 ~5회, 실패 시 3초·6초…≤30초). FCM `cpsm_relationship_consent` 를 받으면 즉시 한 번 더 묻는다. `confirmed` 면 창을 닫고 등록 상태를 다시 받는다. 창에는 `expires_at` 기준 남은 시간을 보이고, 만료·거절되면 [새 QR 받기].
+- **부모가 띄운 QR**: 부모 앱은 아직 `GET /api/parent/pairing-sessions/{id}` 를 짧은 주기로 조회한다(롱폴링 미적용 — 같은 방식으로 바꿀 대상).
 
 ## 3. 상태
 
