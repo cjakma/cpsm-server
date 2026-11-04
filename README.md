@@ -264,3 +264,7 @@ npm run test:v2    # strict 인증: 스코프/가족 격리, 탈취·재페어�
 2. 공개 `GET /api/updates/manifest?platform=android&product=cpsm-m|cpsm-p` 의 `versionCode` 가 설치본보다 크면 업데이트 창(릴리스 노트, [나중에]=그 버전 24시간 보류 / [다운로드 및 설치]).
 3. APK 를 받아 manifest 의 크기·SHA-256, APK 서명 인증서 SHA-256(빌드에 박힌 값·설치본 서명과 모두 같아야)을 확인한 뒤 Android 설치 화면을 연다(사용자가 [업데이트]; 알 수 없는 앱 설치 허용 필요).
 4. 게시: `set -a; . ./.env; set +a; node scripts/publish-artifact.js --platform android --product cpsm-m --input APK --version-code N --version-name V --package-name com.cpsm.child --signing-certificate-sha256 6c28… --release-notes "…"` → `artifacts/android/<product>/latest.json` 갱신(옛 APK 는 그대로 보관).
+
+## 2026-11-04 — 자녀 QR 롱폴링
+- `GET /api/devices/{id}/pairing-sessions/{sid}/wait?since=pending|claimed` (기기 서명 필요, 자기 QR 만): 상태가 `since` 와 다르거나 끝난 상태(confirmed·declined·expired)면 즉시, 아니면 claim/confirm 이벤트(`store.pairingEvents`) 또는 `CPSM_PAIRING_WAIT_MAX_MS`(기본 25000 — guard `proxy_timeout_ms` 30초 아래)까지 기다렸다 `{status, relationship_status, expires_at, expires_in_ms}`.
+- 시험 `npm run test:pairing-wait`(6 assertions). 운영 배포 2026-11-04(백업 `web-service-archive/cpsm/cpsm-server-deploy-backup-20261104b/`), OTA cpsm-m 23.

@@ -10,6 +10,7 @@ const { LocationError, sanitizeGeofence, sanitizeLocationConsent, sanitizeLocati
 
 const ONLINE_WINDOW_MS = 3 * 60 * 1000;
 const STALE_WINDOW_MS = 30 * 60 * 1000;
+const PAIRING_WAIT_MAX_MS = Number(process.env.CPSM_PAIRING_WAIT_MAX_MS || 25000);
 
 const MAX_BODY_BYTES = Number(process.env.CPSM_MAX_BODY_BYTES || 512 * 1024);
 
@@ -923,6 +924,31 @@ async function main() {
         });
         store.audit("device", deviceId, value.consent === true ? "pairing_confirmed" : "pairing_declined", req.headers["x-request-id"] || null, { sessionId: confirmed.sessionId, mappingId: confirmed.mapping.mappingId });
         sendJson(res, 200, { ok: true, pairing_session_id: confirmed.sessionId, mapping: confirmed.mapping, status: confirmed.status, policy_ready: confirmed.status === "confirmed" });
+        return;
+      }
+      // Long-poll for the child's own QR (instead of short polling): answers at once when the state
+      // differs from ?since=, otherwise holds until a claim/confirm event or 25 s (guard proxy
+      // timeout is 30 s). The child re-asks until confirmed/declined/expired — ≤ ~5 requests per QR.
+      const devicePairingWait = pathname.match(/^\/api\/devices\/([^/]+)\/pairing-sessions\/([^/]+)\/wait$/);
+      if (req.method === "GET" && devicePairingWait) {
+        const deviceId = normalizeDeviceId(devicePairingWait[1]);
+        auth.requireDevice(req, deviceId, requestPath, body.raw);
+        const sessionId = decodeURIComponent(devicePairingWait[2]);
+        const since = String(requestUrl.searchParams.get("since") || "");
+        const first = store.pairingWaitState(sessionId, deviceId);
+        if (first.status !== since || ["confirmed", "declined", "expired"].includes(first.status)) {
+          sendJson(res, 200, { ok: true, pairing_session_id: sessionId, ...first });
+          return;
+        }
+        const holdMs = Math.min(PAIRING_WAIT_MAX_MS, first.expires_in_ms + 500);
+        await new Promise((resolve) => {
+          const done = () => { clearTimeout(timer); store.pairingEvents.off(sessionId, done); res.off("close", done); resolve(); };
+          const timer = setTimeout(done, holdMs);
+          store.pairingEvents.on(sessionId, done);
+          res.on("close", done);
+        });
+        if (res.writableEnded || res.destroyed) return;
+        sendJson(res, 200, { ok: true, pairing_session_id: sessionId, ...store.pairingWaitState(sessionId, deviceId) });
         return;
       }
       const devicePairingSession = pathname.match(/^\/api\/devices\/([^/]+)\/pairing-sessions$/);

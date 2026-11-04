@@ -3411,6 +3411,43 @@ class Store {
   }
 }
 
+// Pairing state changes wake the child's long-poll (GET …/pairing-sessions/{id}/wait) at once.
+// Emitted after claim/confirm whether they succeed, decline or expire — waiters re-read the state.
+const { EventEmitter } = require("events");
+Object.defineProperty(Store.prototype, "pairingEvents", {
+  get() {
+    if (!this._pairingEvents) { this._pairingEvents = new EventEmitter(); this._pairingEvents.setMaxListeners(200); }
+    return this._pairingEvents;
+  }
+});
+for (const name of ["claimPairingSession", "confirmPairingSession"]) {
+  const original = Store.prototype[name];
+  Store.prototype[name] = function pairingChange(input) {
+    try {
+      return original.call(this, input);
+    } finally {
+      const sessionId = String((input && input.sessionId) || "");
+      if (sessionId) this.pairingEvents.emit(sessionId);
+    }
+  };
+}
+
+/** Child-visible state of its own QR: pending → claimed (parent scanned) → confirmed | declined | expired. */
+Store.prototype.pairingWaitState = function pairingWaitState(sessionId, deviceId) {
+  const session = this.state.pairingSessions[String(sessionId || "")];
+  if (!session || session.issuerType !== "child" || String(session.childDeviceId || session.issuerId) !== String(deviceId)) {
+    throw new StoreError("pairing_session_not_found", 404);
+  }
+  const expired = Number(session.expiresAt) <= Date.now() && ["pending", "claimed"].includes(session.status);
+  const mapping = session.mappingId ? this.state.parentChildMappings[session.mappingId] : null;
+  return {
+    status: expired ? "expired" : session.status,
+    relationship_status: mapping ? mapping.status : null,
+    expires_at: new Date(Number(session.expiresAt)).toISOString(),
+    expires_in_ms: Math.max(0, Number(session.expiresAt) - Date.now())
+  };
+};
+
 module.exports = {
   Store,
   StoreError,
